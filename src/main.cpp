@@ -191,8 +191,7 @@ void loop() {
   // Send data over BLE at lower rate (to conserve bandwidth)
   if (ble::isConnected() && (nowMs - s_lastBleUpdateMs) >= kBleUpdateIntervalMs) {
     s_lastBleUpdateMs = nowMs;
-    ble::sendf("H:%.1f\n", pos.z * 100.0f);  // Height in cm
-    ble::sendf("V:%.2f\n", vel.z);  // Vertical velocity in m/s
-    ble::sendf("B:%s\n", battery::getStatusString());
+    // CSV format for Bluefruit Connect plotter: "height_cm,velocity_m/s\n"
+    ble::sendf("%.1f,%.2f\n", pos.z * 100.0f, vel.z);
   }
 }
