@@ -1,0 +1,1817 @@
+================================================================================
+                    STRONGTRAK - SYSTEM ARCHITECTURE & ROADMAP
+                              December 20, 2025
+================================================================================
+
+This document captures the long-term vision, architecture, and phased roadmap
+for StrongTrak: a retrofit sensor system for gym cable machines that turns
+every rep into actionable data.
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+1.  EXECUTIVE SUMMARY & PRODUCT VISION
+2.  GLOSSARY OF TERMS
+3.  SYSTEM ARCHITECTURE NARRATIVE
+4.  HARDWARE BLOCK DIAGRAM
+5.  FIRMWARE MODULE ARCHITECTURE
+6.  BLE SERVICES & CHARACTERISTICS STRATEGY
+7.  PHONE APP RESPONSIBILITIES
+8.  BACKEND RESPONSIBILITIES
+9.  QR CLAIM FLOW & BLE DISCOVERY
+10. PHASED ROADMAP WITH MILESTONES
+11. POWER STATE MACHINE
+12. ADVERTISING STRATEGY & POWER TRADEOFFS
+13. MINIMUM VIABLE DATA (MVP PROTOTYPE)
+14. TOP TECHNICAL RISKS & MITIGATIONS
+15. BEST PRACTICES FOR NOVICE EMBEDDED DEVELOPMENT
+16. ASSUMPTIONS & CONSTRAINTS
+17. HANDOFF NOTES FOR FUTURE ENGINEERS
+18. AGENTIC CODING GUIDELINES (FOR AI ASSISTANTS)
+
+================================================================================
+1. EXECUTIVE SUMMARY & PRODUCT VISION
+================================================================================
+
+WHAT IS STRONGTRAK?
+-------------------
+StrongTrak is a small hardware device installed INLINE in the load path of
+gym cable machines - physically bolted between the cable termination and the
+weight stack connection. It measures:
+
+  - FORCE: via an inline load cell (strain gauge sensor)
+  - MOTION: via an IMU (accelerometer + gyroscope)
+
+Data flows wirelessly via BLE to a phone app, then to a cloud backend for
+analysis, tracking, and coaching insights.
+
+THE USER EXPERIENCE VISION
+--------------------------
+1. User walks up to a cable machine.
+2. Scans a QR code mounted on the machine (NOT on the device itself).
+3. Phone app opens, identifies which StrongTrak device is on that machine.
+4. Device appears to "wake up" and connect instantly.
+5. User does their workout. Every rep is captured: force curve, velocity, timing.
+6. User walks away. Device goes back to ultra-low-power standby.
+7. Data syncs to backend. User sees workout summary on their phone.
+
+CRITICAL DESIGN CONSTRAINTS
+---------------------------
+- BATTERY LIFE: Must last months to 1+ year on a single battery. The device
+  must be "always available" yet draw almost nothing when idle.
+
+- ENVIRONMENT: Installed near a steel weight stack. Subject to vibration,
+  shock, EMI (electrical noise from gym equipment motors), RF attenuation
+  (radio signals blocked by steel), sweat, dirt, and temperature swings.
+
+- INLINE INSTALLATION: Requires a wrench. Not a casual consumer installation.
+  This is a gym owner/operator install or a dedicated hardware install service.
+
+- SCALABILITY: A single gym may have 20-50 StrongTrak devices. The system
+  must handle discovery, connection, and data routing without collisions.
+
+
+================================================================================
+2. GLOSSARY OF TERMS
+================================================================================
+
+ADC         Analog-to-Digital Converter. Converts analog voltage signals
+            (like from a load cell) into digital numbers the microcontroller
+            can process.
+
+BLE         Bluetooth Low Energy. A wireless protocol designed for low power
+            consumption. Used for communication between device and phone.
+
+Central     In BLE, the device that initiates connections (usually the phone).
+
+Characteristic
+            A BLE data container within a Service. Think of it as a single
+            variable that can be read, written, or subscribed to for updates.
+
+DFU         Device Firmware Update. The process of updating the firmware on a
+            device, often done wirelessly (see FUOTA).
+
+Duty Cycle  The percentage of time something is "on" vs "off." Lower duty
+            cycle = lower power consumption.
+
+EMA         Exponential Moving Average. A type of filter that smooths noisy
+            data by giving more weight to recent samples.
+
+EMI         Electromagnetic Interference. Electrical noise that can corrupt
+            sensor readings or wireless signals.
+
+FUOTA       Firmware Update Over The Air. Updating device firmware via
+            wireless connection (BLE or WiFi) without physical access.
+
+GATT        Generic Attribute Profile. The BLE protocol that defines how data
+            is organized into Services and Characteristics.
+
+GPIO        General Purpose Input/Output. Pins on a microcontroller that can
+            be configured as inputs (read sensors) or outputs (control LEDs).
+
+HX711       A specific IC (integrated circuit) that amplifies tiny signals
+            from strain gauge load cells and converts them to digital values.
+            Very common in DIY scale projects.
+
+I2C         Inter-Integrated Circuit. A two-wire communication protocol used
+            to connect sensors to microcontrollers. Pronounced "I-squared-C."
+
+IMU         Inertial Measurement Unit. A sensor package containing an
+            accelerometer (measures acceleration/tilt) and gyroscope
+            (measures rotation rate). Some include magnetometers.
+
+Interrupt   A hardware signal that immediately gets the processor's attention,
+            waking it from sleep or interrupting normal code execution.
+
+Load Cell   A transducer (sensor) that converts mechanical force into an
+            electrical signal. Strain gauges deform under load, changing
+            their resistance.
+
+MCU         Microcontroller Unit. The "brain" of the device - a small
+            computer on a single chip.
+
+MTU         Maximum Transmission Unit. The largest packet size that can be
+            sent in one BLE transaction. Larger MTU = fewer packets needed.
+
+NUS         Nordic UART Service. A pre-defined BLE service that mimics a
+            serial port. Simple to use but not optimized for structured data.
+
+Peripheral  In BLE, the device that advertises and accepts connections
+            (the StrongTrak sensor). Opposite of Central.
+
+QoS         Quality of Service. Guarantees about data delivery (e.g.,
+            "every packet must be acknowledged").
+
+RF          Radio Frequency. The electromagnetic waves used for wireless
+            communication (BLE, WiFi, etc.).
+
+RTC         Real-Time Clock. A low-power clock that keeps time even when the
+            main processor is asleep.
+
+Service     A BLE container that groups related Characteristics. Like a
+            folder containing files.
+
+SPI         Serial Peripheral Interface. A faster alternative to I2C for
+            connecting sensors, using 4 wires instead of 2.
+
+State Machine
+            A programming pattern where the system is always in one defined
+            "state" and transitions between states based on events. Much
+            cleaner than complex if/else chains.
+
+Strain Gauge
+            A resistor that changes resistance when stretched or compressed.
+            The sensing element inside a load cell.
+
+UUID        Universally Unique Identifier. A 128-bit number that identifies
+            a BLE Service or Characteristic. Custom services need custom UUIDs.
+
+ZUPT        Zero Velocity Update. A technique to reduce drift in position
+            tracking by resetting velocity to zero when the device is known
+            to be stationary.
+
+
+================================================================================
+3. SYSTEM ARCHITECTURE NARRATIVE
+================================================================================
+
+THE BIG PICTURE
+---------------
+StrongTrak is a distributed system with four major components:
+
+  ┌─────────────────┐      BLE       ┌─────────────────┐
+  │   STRONGTRAK    │◄──────────────►│   PHONE APP     │
+  │     DEVICE      │                │   (Central)     │
+  │   (Peripheral)  │                └────────┬────────┘
+  └─────────────────┘                         │
+                                              │ HTTPS/WebSocket
+                                              ▼
+                                    ┌─────────────────┐
+                                    │     BACKEND     │
+                                    │   (Cloud API)   │
+                                    └────────┬────────┘
+                                              │
+                                              ▼
+                                    ┌─────────────────┐
+                                    │    DATABASE     │
+                                    │  (User Data,    │
+                                    │   Workouts)     │
+                                    └─────────────────┘
+
+Later, we add a fifth component for multi-device scaling:
+
+  ┌─────────────────┐      BLE       ┌─────────────────┐
+  │   STRONGTRAK    │◄──────────────►│   GYM HUB       │
+  │    DEVICES      │                │   (Gateway)     │
+  │   (Multiple)    │                └────────┬────────┘
+  └─────────────────┘                         │
+                                              │ WiFi/Ethernet
+                                              ▼
+                                    ┌─────────────────┐
+                                    │     BACKEND     │
+                                    └─────────────────┘
+
+DATA OWNERSHIP MODEL
+--------------------
+- The DEVICE knows nothing about users. It has a unique device_id burned in.
+- The BACKEND maps device_id -> machine_id -> gym_id.
+- When a user scans a QR code, the app asks the backend: "What device_id is
+  associated with this machine?" Then it connects to that device via BLE.
+- The backend associates workout data with the user based on:
+  * Which user's app connected to which device_id
+  * Time window of the session
+
+This means the device firmware stays simple and doesn't need user management.
+
+
+================================================================================
+4. HARDWARE BLOCK DIAGRAM
+================================================================================
+
+                    ┌─────────────────────────────────────┐
+                    │         STRONGTRAK DEVICE           │
+                    │                                     │
+  ┌─────────┐       │  ┌─────────────────────────────┐   │
+  │  LOAD   │───────┼─►│          HX711              │   │
+  │  CELL   │       │  │   (Amplifier + 24-bit ADC)  │   │
+  │ 0-200kg │       │  └──────────┬──────────────────┘   │
+  └─────────┘       │             │ GPIO (Data + Clock)  │
+                    │             ▼                      │
+                    │  ┌─────────────────────────────┐   │
+                    │  │      nRF52840 MCU           │   │
+                    │  │  ┌─────────────────────┐    │   │
+                    │  │  │  ARM Cortex-M4F     │    │   │◄──► BLE Antenna
+                    │  │  │  64 MHz, 256KB RAM  │    │   │
+                    │  │  │  1MB Flash          │    │   │
+                    │  │  └─────────────────────┘    │   │
+                    │  │         │ I2C                │   │
+                    │  └─────────┼────────────────────┘   │
+                    │            ▼                       │
+                    │  ┌─────────────────────────────┐   │
+                    │  │   ONBOARD SENSORS           │   │
+                    │  │   - LSM6DS3TR-C (IMU)       │   │
+                    │  │   - LIS3MDL (Magnetometer)  │   │
+                    │  └─────────────────────────────┘   │
+                    │                                     │
+                    │  ┌─────────────────────────────┐   │
+                    │  │   POWER SYSTEM              │   │
+                    │  │   - LiPo Battery (or CR123) │   │
+                    │  │   - Voltage Regulator       │   │
+                    │  └─────────────────────────────┘   │
+                    │                                     │
+                    └─────────────────────────────────────┘
+
+KEY HARDWARE INTERFACES
+-----------------------
+1. HX711 <-> MCU: Two GPIO pins (Data + Clock). This is a bit-banged protocol
+   (manually toggling pins), not I2C or SPI. The HX711 is slow (~10-80 Hz)
+   but very low power when idle.
+
+2. IMU <-> MCU: I2C bus at 400 kHz. The IMU can generate interrupts on motion
+   detection, which is critical for waking the device from sleep.
+
+3. BLE Radio: Built into the nRF52840. Shares the same processor but has its
+   own power domain that can stay active during sleep.
+
+
+================================================================================
+5. FIRMWARE MODULE ARCHITECTURE
+================================================================================
+
+The firmware should be organized into clean, single-responsibility modules.
+Here's the target structure:
+
+strongtrak/
+├── platformio.ini              # Build configuration
+├── src/
+│   ├── main.cpp                # Entry point, setup(), loop() orchestration
+│   │
+│   ├── config.h                # Global constants, pin definitions, timing
+│   │
+│   ├── state_machine.h/.cpp    # Central state machine (IDLE, CONNECTED, etc.)
+│   │
+│   ├── sensors/
+│   │   ├── imu.h/.cpp          # IMU abstraction (current code)
+│   │   ├── loadcell.h/.cpp     # HX711 + load cell driver
+│   │   └── battery.h/.cpp      # Battery voltage monitoring
+│   │
+│   ├── processing/
+│   │   ├── filter.h/.cpp       # EMA, Kalman, or other filters
+│   │   ├── rep_detector.h/.cpp # Rep detection algorithm (Phase 4)
+│   │   └── calibration.h/.cpp  # Load cell calibration routines
+│   │
+│   ├── comms/
+│   │   ├── ble_service.h/.cpp  # BLE GATT service definitions
+│   │   ├── ble_streaming.h/.cpp# Data packet formatting & transmission
+│   │   └── protocol.h          # Packet structure definitions
+│   │
+│   ├── power/
+│   │   ├── power_manager.h/.cpp# Sleep modes, wake sources
+│   │   └── advertising.h/.cpp  # Advertising interval management
+│   │
+│   └── storage/
+│       └── flash_log.h/.cpp    # Unclaimed rep storage (Phase 4+)
+│
+├── include/                    # Public headers if needed
+├── lib/                        # Private/local libraries
+├── test/                       # Unit tests (native platform)
+└── tools/                      # Helper scripts
+
+MODULE RESPONSIBILITIES
+-----------------------
+
+main.cpp
+  - Initialize all modules in correct order
+  - Run the main loop (non-blocking)
+  - Delegate to state_machine for decision-making
+
+state_machine
+  - Defines all system states (IDLE_ADV_SLOW, CONNECTED, STREAMING, etc.)
+  - Handles transitions based on events (connection, motion, timeout)
+  - Coordinates power management decisions
+
+sensors/imu
+  - Initialize IMU with correct variant detection (current code)
+  - Configure motion interrupts for wake
+  - Read filtered accelerometer/gyroscope data
+  - Provide "is moving" detection
+
+sensors/loadcell
+  - Initialize HX711 with gain setting
+  - Read raw ADC values
+  - Apply calibration (offset + scale factor)
+  - Return force in kg or Newtons
+
+sensors/battery
+  - Read battery voltage via ADC
+  - Provide battery percentage estimate
+  - Alert when low
+
+processing/filter
+  - Generic filtering (EMA, moving average, Kalman)
+  - Configurable per-signal
+
+processing/rep_detector
+  - State machine for rep detection (later phase)
+  - Detects: rep start, rep end, concentric/eccentric phases
+  - Outputs: rep count, peak force, tempo
+
+processing/calibration
+  - Store calibration values in flash
+  - Provide calibration routines (tare, two-point cal)
+
+comms/ble_service
+  - Define custom GATT service with characteristics
+  - Handle connection/disconnection callbacks
+  - Manage MTU negotiation
+
+comms/ble_streaming
+  - Pack sensor data into efficient packets
+  - Handle flow control (don't overflow buffers)
+  - Provide send queue with retry logic
+
+power/power_manager
+  - Configure sleep modes (System ON, System OFF)
+  - Manage wake sources (BLE, GPIO, RTC timer)
+  - Coordinate with state machine
+
+power/advertising
+  - Set advertising intervals based on state
+  - Manage advertising data (device name, service UUIDs)
+
+
+================================================================================
+6. BLE SERVICES & CHARACTERISTICS STRATEGY
+================================================================================
+
+PHASE 1-2: USE NORDIC UART SERVICE (NUS)
+-----------------------------------------
+For early development, continue using NUS. It's simple and works.
+
+  Service: Nordic UART Service (6E400001-B5A3-F393-E0A9-E50E24DCCA9E)
+  Characteristics:
+    - TX (notify): Device sends data to phone
+    - RX (write):  Phone sends commands to device
+
+Data format: ASCII strings like "F:123.4,A:0.12,0.03,9.81\n"
+
+Pros: Simple, works with generic BLE UART apps, easy debugging.
+Cons: Inefficient (text vs binary), no structured data, limited features.
+
+PHASE 3+: MIGRATE TO CUSTOM GATT SERVICE
+----------------------------------------
+Define a custom service tailored to StrongTrak's needs:
+
+  Service: StrongTrak Sensor Service (custom 128-bit UUID)
+
+  Characteristics:
+
+  1. Force Data (notify, 4 bytes)
+     - Raw or calibrated force as float32
+     - Notify rate: 10-80 Hz
+
+  2. IMU Data (notify, 12 bytes)
+     - Accel X,Y,Z as int16 (scaled)
+     - Or full 24 bytes for accel + gyro
+
+  3. Rep Event (notify, variable)
+     - Triggered on rep completion
+     - Contains: rep number, peak force, duration, tempo
+
+  4. Device Status (read, 8 bytes)
+     - Battery level, connection state, error flags
+
+  5. Command (write, variable)
+     - Tare, calibrate, start/stop streaming, enter DFU
+
+  6. Config (read/write, variable)
+     - Sampling rate, filter settings, thresholds
+
+WHY CUSTOM SERVICE LATER?
+-------------------------
+- Binary data is 3-5x more efficient than ASCII text
+- Separate characteristics allow subscribing to only what you need
+- Structured data reduces parsing errors
+- Enables future features (config, commands) cleanly
+
+BUT: Custom services require custom app code. NUS works with off-the-shelf
+apps. Start simple, migrate when you have app development resources.
+
+
+================================================================================
+7. PHONE APP RESPONSIBILITIES
+================================================================================
+
+The phone app (iOS/Android) is the "Central" in BLE terms. Its jobs:
+
+1. QR CODE SCANNING
+   - Scan QR code on machine
+   - Extract machine_id from QR payload
+   - Query backend: "What device_id is on machine_id X?"
+
+2. BLE DISCOVERY & CONNECTION
+   - Scan for BLE devices advertising StrongTrak service
+   - Match device by device_id (in advertising data or after connection)
+   - Handle connection, reconnection, timeout
+
+3. DATA RECEPTION
+   - Subscribe to notify characteristics
+   - Receive streaming data packets
+   - Buffer and batch for upload
+
+4. EDGE PROCESSING (OPTIONAL)
+   - Early: just relay raw data
+   - Later: run rep detection on phone if device doesn't
+
+5. BACKEND SYNC
+   - Upload workout data to backend
+   - Receive user profile, workout history
+   - Handle offline mode (queue uploads)
+
+6. USER INTERFACE
+   - Live force/velocity display during workout
+   - Rep counter, set timer
+   - Workout summary and history
+
+7. DEVICE MANAGEMENT
+   - Trigger calibration
+   - Initiate firmware update
+   - View device status/battery
+
+
+================================================================================
+8. BACKEND RESPONSIBILITIES
+================================================================================
+
+1. DEVICE REGISTRY
+   - Map device_id -> machine_id -> gym_id
+   - Provision new devices
+   - Track device status, firmware version
+
+2. USER MANAGEMENT
+   - Authentication, profiles
+   - Subscription/billing (if applicable)
+
+3. WORKOUT DATA INGESTION
+   - Receive workout data from app
+   - Associate with user and device
+   - Store time-series data
+
+4. ANALYTICS & INSIGHTS
+   - Calculate derived metrics
+   - Trend analysis, PRs
+   - Coaching recommendations (AI potential)
+
+5. FIRMWARE DISTRIBUTION
+   - Host firmware binaries
+   - Manage version rollouts
+   - Track update status per device
+
+6. GYM MANAGEMENT (LATER)
+   - Dashboard for gym owners
+   - Aggregate usage stats
+   - Device health monitoring
+
+
+================================================================================
+9. QR CLAIM FLOW & BLE DISCOVERY
+================================================================================
+
+This is how the "scan and it wakes" illusion works:
+
+USER FLOW
+---------
+1. User opens StrongTrak app
+2. App shows "Scan a machine to start"
+3. User scans QR code on machine
+4. QR contains: machine_id (e.g., "gym123-cable-crossover-1")
+5. App calls backend: GET /api/machines/{machine_id}/device
+6. Backend returns: { "device_id": "ST-00A1B2C3", "device_name": "StrongTrak-A1B2" }
+7. App starts BLE scan, filtering for device_name or device_id in advertising data
+8. Device is found (was advertising all along at low duty cycle)
+9. App connects
+10. Connection triggers device to exit low-power mode and start streaming
+
+THE "INSTANT WAKE" ILLUSION
+---------------------------
+The device isn't actually asleep. It's advertising continuously, just slowly
+(e.g., one advertisement every 3 seconds). The trick:
+
+- The QR scan -> backend lookup takes 0.5-2 seconds (network latency)
+- BLE scan can start during this time
+- By the time the UI says "connecting," the device was likely already found
+- The "wake" is just the UI transition, not the device transition
+
+If the device truly needs to wake faster:
+- IMU motion interrupt can trigger faster advertising
+- When someone touches the cable, device detects motion -> boosts to 100ms ads
+- This increases discoverability just when someone is about to use it
+
+ADVERTISING DATA STRATEGY
+-------------------------
+The device should advertise:
+- Device name: "StrongTrak-XXXX" (last 4 of device_id)
+- Service UUID: StrongTrak custom service (or NUS early on)
+- Manufacturer data: Full device_id for exact matching
+
+This allows the app to:
+- Filter scan results by service UUID (fast)
+- Match exact device_id from backend response
+- Connect to the correct device even with 50 devices in range
+
+
+================================================================================
+10. PHASED ROADMAP WITH MILESTONES
+================================================================================
+
+------------------------------------------------------------------------------
+PHASE 0: IMU TESTBED STABILITY (CURRENT - 1-2 weeks)
+------------------------------------------------------------------------------
+
+GOAL: Stabilize current codebase, establish good practices, prepare for HX711.
+
+TASKS:
+[x] IMU streaming with auto-detection (DONE)
+[x] EMA smoothing (DONE)
+[x] BLE NUS transmission (DONE)
+[x] Position tracking prototype (DONE)
+[ ] Clean up code: consistent naming, remove dead code
+[ ] Add basic error handling and watchdog
+[ ] Document all modules with header comments
+[ ] Create simple test procedures document
+
+SUCCESS CRITERIA:
+- Device runs for 24 hours without crash
+- BLE reconnects reliably after disconnect
+- Code is clean enough to show an advisor
+
+KEY RISKS:
+- None significant, this is stabilization
+
+PROOF TEST:
+- Leave device running overnight, check it still streams in morning
+- Disconnect/reconnect BLE 10 times, verify no hangs
+
+------------------------------------------------------------------------------
+PHASE 1: HX711 + LOAD CELL INTEGRATION (2-4 weeks)
+------------------------------------------------------------------------------
+
+GOAL: Read force data from inline load cell via HX711.
+
+TASKS:
+[ ] Wire HX711 to Feather (Data -> GPIO, Clock -> GPIO, VCC, GND)
+[ ] Create loadcell.h/.cpp module
+[ ] Implement HX711 bit-bang protocol (or use library)
+[ ] Read raw ADC values, verify stability
+[ ] Implement tare (zero offset)
+[ ] Implement two-point calibration (known weights)
+[ ] Store calibration in flash (Preferences or LittleFS)
+[ ] Add load cell data to BLE stream
+[ ] Add load cell data to Teleplot output
+
+SUCCESS CRITERIA:
+- Read force with <1% error after calibration
+- Tare works reliably
+- Data streams alongside IMU
+
+KEY RISKS:
+- HX711 NOISE: The HX711 is notoriously sensitive to electrical noise.
+  Mitigation: Use shielded cable, keep wires short, add decoupling caps.
+
+- SAMPLE RATE TRADEOFF: HX711 max rate is 80 Hz (at lower resolution) or
+  10 Hz (at higher resolution, 24-bit mode). Must choose based on needs.
+  Mitigation: Start with 10 Hz for stability, increase if needed.
+
+- POWER: HX711 draws ~1.5mA when active. Must power down between samples.
+  Mitigation: Use HX711 power-down mode (clock high for >60µs).
+
+PROOF TEST:
+- Hang known weight (e.g., 10 kg), verify reading is accurate ±0.1 kg
+- Tare, add weight, verify reads correctly, remove weight, verify returns to 0
+
+LIBRARIES TO EVALUATE:
+- "bogde/HX711" - most popular, but may have issues
+- "olkal/HX711_ADC" - more advanced, async support
+- Write your own bit-bang (simple, full control)
+
+Recommendation: Write your own. The protocol is simple (24 clock pulses to
+read 24 bits), and you'll understand it fully. Avoid library surprises.
+
+------------------------------------------------------------------------------
+PHASE 2: BLE PACKET FORMAT + ROBUST STREAMING (2-3 weeks)
+------------------------------------------------------------------------------
+
+GOAL: Define efficient data format, handle connection robustness.
+
+TASKS:
+[ ] Define binary packet format (header, timestamp, force, accel, gyro)
+[ ] Implement packet packing in ble_streaming.cpp
+[ ] Handle MTU negotiation for larger packets
+[ ] Implement connection event callbacks (connect, disconnect, param update)
+[ ] Add reconnection handling on device side
+[ ] Test streaming under load (fast movement, many reps)
+[ ] Measure actual throughput and latency
+
+SUCCESS CRITERIA:
+- <50ms latency from sensor read to phone receipt
+- No data loss during normal workout
+- Graceful handling of disconnect/reconnect
+
+KEY RISKS:
+- THROUGHPUT LIMITS: BLE can do ~1-2 KB/s realistically with connection
+  intervals and MTU limits. Raw streaming at 50 Hz may overflow.
+  Mitigation: Calculate exact bandwidth needs. At 50 Hz, 20 bytes/sample =
+  1000 bytes/sec. Should be OK with 247-byte MTU and proper intervals.
+
+- CONNECTION PARAMETER NEGOTIATION: iOS is strict about connection intervals.
+  Mitigation: Use Apple-recommended intervals (15-30ms for streaming).
+
+PROOF TEST:
+- Stream at target rate for 5 minutes, count packets, verify none lost
+- Simulate workout (move device, vary force), verify data integrity
+
+BINARY PACKET FORMAT (PROPOSAL):
+  Bytes 0-3:   Timestamp (ms since boot, uint32)
+  Bytes 4-7:   Force (float32, kg)
+  Bytes 8-9:   Accel X (int16, milli-g)
+  Bytes 10-11: Accel Y (int16, milli-g)
+  Bytes 12-13: Accel Z (int16, milli-g)
+  Bytes 14-15: Gyro X (int16, deci-deg/s)
+  Bytes 16-17: Gyro Y (int16, deci-deg/s)
+  Bytes 18-19: Gyro Z (int16, deci-deg/s)
+  Total: 20 bytes per sample
+
+------------------------------------------------------------------------------
+PHASE 3: POWER OPTIMIZATION + "INSTANT WAKE" (3-4 weeks)
+------------------------------------------------------------------------------
+
+GOAL: Achieve target battery life while maintaining discoverability.
+
+TASKS:
+[ ] Implement power state machine (see Section 11)
+[ ] Configure nRF52840 sleep modes (System ON sleep with RAM retention)
+[ ] Set up IMU motion interrupt as wake source
+[ ] Implement adaptive advertising (slow idle, fast on motion)
+[ ] Power down HX711 between samples
+[ ] Measure current draw in each state (need current meter or Power Profiler)
+[ ] Calculate expected battery life
+[ ] Test wake latency (motion to discoverable)
+
+SUCCESS CRITERIA:
+- Idle current draw <20µA (stretch goal: <10µA)
+- Active streaming <5mA average
+- Wake from motion to discoverable <100ms
+- Estimated battery life >6 months on CR2032 (or suitable battery)
+
+KEY RISKS:
+- ACHIEVING LOW IDLE CURRENT: Many things can prevent deep sleep (GPIO
+  configuration, peripheral leakage, BLE stack overhead).
+  Mitigation: Use Nordic Power Profiler Kit to identify current hogs.
+  Disable all unused peripherals. Use internal pull-ups/downs correctly.
+
+- IMU INTERRUPT RELIABILITY: The motion interrupt must be tuned to trigger
+  on actual use, not vibration from adjacent machines.
+  Mitigation: Set appropriate threshold, add debouncing, test in gym.
+
+- BLE ADVERTISING OVERHEAD: Even slow advertising consumes power.
+  Mitigation: Use lowest TX power that works. Test range in gym environment.
+
+PROOF TEST:
+- Measure idle current, verify <20µA
+- Device in idle for 1 hour, wave hand near it (motion), verify BLE appears
+  within 500ms
+- Calculate: battery_mAh / idle_mA = hours of life
+
+CURRENT BUDGET EXAMPLE:
+  Idle (advertising 3s interval): ~10µA average
+  Motion-boosted advertising: ~100µA average (for 5 seconds)
+  Active streaming: ~3mA average
+  
+  Assuming 1 hour active use per day, 23 hours idle:
+  Daily consumption = (23 * 0.01) + (1 * 3) = 0.23 + 3 = 3.23 mAh/day
+  CR2450 battery (550 mAh): 550 / 3.23 = 170 days ≈ 5.5 months
+  
+  With larger battery (e.g., LiPo 350 mAh rechargeable): ~3.5 months
+  With even larger (LiPo 1000 mAh): ~10 months
+
+------------------------------------------------------------------------------
+PHASE 4: REP DETECTION + EDGE FEATURES (4-6 weeks)
+------------------------------------------------------------------------------
+
+GOAL: Move rep detection to device, reduce data transmission.
+
+TASKS:
+[ ] Design rep detection algorithm (force threshold + direction)
+[ ] Implement rep_detector.h/.cpp module
+[ ] Detect: rep start, rep end, concentric/eccentric phases
+[ ] Calculate: peak force, average force, duration, tempo
+[ ] Create "rep event" BLE characteristic
+[ ] Optionally continue raw streaming for debugging
+[ ] Compare on-device vs phone-calculated rep metrics
+[ ] Store "unclaimed reps" to flash when not connected
+
+SUCCESS CRITERIA:
+- Rep detection accuracy >95% compared to manual count
+- Latency from rep end to phone notification <200ms
+- Works for various exercises (pulldowns, rows, curls)
+
+KEY RISKS:
+- ALGORITHM COMPLEXITY: Different exercises have different force profiles.
+  A lat pulldown looks different from a cable curl.
+  Mitigation: Start with simple force threshold crossing. Tune per exercise
+  type if needed. Log raw data to refine algorithm.
+
+- FALSE POSITIVES: Adjusting weight, bumping machine triggers false reps.
+  Mitigation: Require minimum force AND minimum duration. Add settling time.
+
+- FLASH WEAR: Writing to flash frequently wears it out (limited cycles).
+  Mitigation: Buffer in RAM, write in batches. Use wear-leveling (LittleFS).
+
+PROOF TEST:
+- Do 10 reps, device counts 10 reps
+- Compare device-calculated peak force to known weight
+
+REP DETECTION ALGORITHM (SIMPLE):
+  State: IDLE | IN_REP
+  
+  IDLE:
+    if force > START_THRESHOLD && derivative positive:
+      enter IN_REP
+      record start_time, reset max_force
+  
+  IN_REP:
+    max_force = max(max_force, force)
+    if force < END_THRESHOLD && derivative negative:
+      exit IN_REP
+      emit rep_event(duration, max_force, ...)
+      enter IDLE
+
+------------------------------------------------------------------------------
+PHASE 5: MULTI-DEVICE GYM SCALING (2-3 weeks)
+------------------------------------------------------------------------------
+
+GOAL: Ensure system works with many devices in one gym.
+
+TASKS:
+[ ] Test BLE discovery with 5+ devices in range
+[ ] Ensure device_id filtering works in app
+[ ] Test concurrent connections (if hub scenario)
+[ ] Implement unique advertising data per device
+[ ] Test RF behavior near steel weight stacks
+[ ] Document installation best practices (antenna orientation, etc.)
+
+SUCCESS CRITERIA:
+- App can find correct device among 10+ advertising devices in <3 seconds
+- No cross-talk or data mixing between devices
+- Works reliably in gym RF environment
+
+KEY RISKS:
+- RF SHADOWING: Steel weight stacks may block BLE signals.
+  Mitigation: Test antenna placement. May need external antenna. Consider
+  device mounting location carefully.
+
+- ADVERTISING COLLISIONS: Many devices advertising can cause collisions.
+  Mitigation: Random advertising intervals (add jitter). Use filtering.
+
+- CHANNEL CONGESTION: Gyms have WiFi, other BLE devices, microwaves, etc.
+  Mitigation: BLE is designed for this (frequency hopping). Test in real gym.
+
+PROOF TEST:
+- Place 5 devices in a room, verify app connects to correct one every time
+- Test with device behind steel plate, verify still discoverable
+
+------------------------------------------------------------------------------
+PHASE 6: HUB/GATEWAY + STORE-AND-FORWARD (4-6 weeks)
+------------------------------------------------------------------------------
+
+GOAL: Enable data collection without requiring phone connection.
+
+CONCEPT:
+A dedicated "hub" device (e.g., Raspberry Pi or ESP32) installed in the gym
+connects to multiple StrongTrak devices simultaneously and uploads data to
+backend via WiFi/Ethernet.
+
+TASKS:
+[ ] Design hub architecture (which platform, how many connections)
+[ ] Implement hub firmware (Central role, multiple connections)
+[ ] Design backend protocol for hub uploads
+[ ] Handle intermittent hub connectivity
+[ ] Device stores locally, hub pulls data periodically
+
+SUCCESS CRITERIA:
+- Hub connects to 5+ devices simultaneously
+- Data uploaded within 1 minute of generation
+- System tolerates hub disconnections gracefully
+
+KEY RISKS:
+- BLE CENTRAL LIMITATIONS: nRF52840 can maintain ~20 connections as Central,
+  but bandwidth is shared. More connections = lower throughput per device.
+  Mitigation: Hub only connects during active use, disconnects after idle.
+
+- COMPLEXITY: Adding a hub is a significant architectural change.
+  Mitigation: Design device to work both direct-to-phone AND via hub.
+
+PROOF TEST:
+- Hub connects to 3 devices, collects data from all, uploads to backend
+- Disconnect hub WiFi, verify data queues locally, uploads when restored
+
+------------------------------------------------------------------------------
+PHASE 7: FUOTA/DFU PIPELINE (3-4 weeks)
+------------------------------------------------------------------------------
+
+GOAL: Enable firmware updates without physical access.
+
+TASKS:
+[ ] Enable Nordic DFU bootloader on device
+[ ] Implement DFU trigger via BLE command
+[ ] Create firmware build pipeline with versioning
+[ ] Implement firmware distribution via backend
+[ ] Create update flow in app
+[ ] Test update process thoroughly
+[ ] Implement rollback mechanism for failed updates
+
+SUCCESS CRITERIA:
+- App can update device firmware in <2 minutes
+- Failed update does not brick device
+- Version tracking in backend
+
+KEY RISKS:
+- BRICKING: Failed DFU can leave device unbootable.
+  Mitigation: Nordic DFU has dual-bank (keeps old firmware until new is
+  verified). Test extensively. Keep physical DFU access as fallback.
+
+- SECURITY: Unsigned firmware could be malicious.
+  Mitigation: Sign firmware binaries. Device verifies signature before applying.
+
+PROOF TEST:
+- Create new firmware version, push via app, verify device runs new version
+- Intentionally corrupt firmware file, verify device rejects it
+
+
+================================================================================
+11. POWER STATE MACHINE
+================================================================================
+
+The device should operate as a state machine with well-defined power modes:
+
+                    ┌──────────────────────────────────────────┐
+                    │                                          │
+         boot       ▼                                          │
+      ──────► ┌───────────┐  motion detected   ┌───────────┐   │
+              │   IDLE    │───────────────────►│  BOOST    │   │
+              │ ADV_SLOW  │◄───────────────────│ ADV_FAST  │   │
+              └─────┬─────┘   timeout (10s)    └─────┬─────┘   │
+                    │                                │         │
+                    │ BLE connect                    │ BLE connect
+                    │                                │         │
+                    ▼                                ▼         │
+              ┌─────────────────────────────────────────┐      │
+              │              CONNECTED                  │      │
+              │  (low-power idle, waiting for command)  │      │
+              └──────────────────┬──────────────────────┘      │
+                                 │                             │
+                                 │ start streaming command     │
+                                 ▼                             │
+              ┌─────────────────────────────────────────┐      │
+              │              STREAMING                  │      │
+              │  (active sampling + BLE transmission)   │      │
+              └──────────────────┬──────────────────────┘      │
+                                 │                             │
+                                 │ stop command / idle timeout │
+                                 │                             │
+                    ┌────────────┴────────────┐               │
+                    │                         │               │
+                    ▼                         ▼               │
+              ┌───────────┐            ┌───────────┐          │
+              │ CONNECTED │            │ DISCONNECT│──────────┘
+              │  (idle)   │            │ ADV_SLOW  │
+              └───────────┘            └───────────┘
+
+
+STATE DEFINITIONS
+-----------------
+
+IDLE_ADV_SLOW (Target: <15µA average)
+  - Advertising every 3000ms (3 seconds)
+  - TX power: -8 dBm (low, saves power)
+  - MCU in System ON sleep between advertisements
+  - IMU in low-power mode with motion interrupt enabled
+  - HX711 powered down
+  - Wake sources: BLE connection, IMU motion interrupt
+
+BOOST_ADV_FAST (Target: <200µA average)
+  - Triggered by IMU motion interrupt
+  - Advertising every 100ms for 10 seconds
+  - TX power: 0 dBm (higher for better discoverability)
+  - After 10 seconds without connection, return to IDLE_ADV_SLOW
+  - Purpose: When someone touches the cable, device becomes highly discoverable
+
+CONNECTED (Target: <100µA average)
+  - BLE connection established
+  - Advertising stopped
+  - Waiting for commands from Central
+  - IMU in low-power mode (or off)
+  - HX711 powered down
+  - MCU mostly sleeping, wakes on BLE events
+
+STREAMING (Target: <5mA average)
+  - Active data collection and transmission
+  - IMU sampling at 50 Hz
+  - HX711 sampling at 10-80 Hz
+  - BLE notifications at configured rate
+  - MCU mostly active
+
+ERROR (Varies)
+  - Something went wrong (sensor failure, BLE error)
+  - LED blinking pattern indicates error type
+  - May attempt recovery or wait for reset
+
+DFU_READY (Full power)
+  - Bootloader mode, ready for firmware update
+  - Triggered by command or button combo
+  - Full power, waiting for DFU transfer
+
+
+================================================================================
+12. ADVERTISING STRATEGY & POWER TRADEOFFS
+================================================================================
+
+THE FUNDAMENTAL TRADEOFF
+------------------------
+Advertising more frequently = more discoverable = higher power consumption.
+Advertising less frequently = harder to find = lower power consumption.
+
+ADVERTISING INTERVALS EXPLAINED
+-------------------------------
+When a BLE Peripheral advertises, it sends a packet on 3 channels:
+  - Channel 37 (2402 MHz)
+  - Channel 38 (2426 MHz)
+  - Channel 39 (2480 MHz)
+
+Each advertisement takes ~1-3ms of radio time. The interval between
+advertisements determines average power consumption.
+
+INTERVAL MATH
+-------------
+Rough power consumption (nRF52840, 0 dBm TX):
+  - 100ms interval:  ~100µA average
+  - 500ms interval:  ~20µA average
+  - 1000ms interval: ~10µA average
+  - 3000ms interval: ~4µA average
+
+DISCOVERY TIME
+--------------
+A Central (phone) scanning for devices will find an advertising device
+when their windows overlap. Typical phone scan:
+  - Scan window: 30-50ms
+  - Scan interval: 100-200ms (iOS) or configurable (Android)
+
+With 3-second advertising interval, worst-case discovery time:
+  - 3 seconds to next advertisement
+  - Plus scan/advertisement alignment
+  - Total: up to 3-4 seconds
+
+With 100ms advertising interval:
+  - Typically found within 100-300ms
+
+THE "INSTANT" ILLUSION STRATEGY
+-------------------------------
+We want the user to feel like scanning the QR code "wakes" the device
+instantly. Here's how to create that illusion:
+
+1. PIPELINE THE DELAY:
+   - QR scan triggers network request to backend
+   - Backend lookup takes 0.5-2 seconds
+   - BLE scan starts immediately in parallel
+   - By the time backend responds, device may already be found
+
+2. USE MOTION BOOST:
+   - When someone touches the cable machine (adjusts weight, grabs handle),
+     the IMU detects motion
+   - Device immediately boosts to 100ms advertising for 10 seconds
+   - By the time user scans QR, device is in fast-advertising mode
+
+3. UI TIMING TRICKS:
+   - Show "Connecting..." animation for minimum 1 second regardless
+   - Gives time for discovery even with slow advertising
+   - Users expect a brief connection delay
+
+4. SCAN RESULT CACHING:
+   - App can cache known devices it's seen recently
+   - If device was seen in last 5 minutes, skip full scan
+
+RECOMMENDED ADVERTISING PARAMETERS
+----------------------------------
+Idle State (IDLE_ADV_SLOW):
+  - Interval: 3000ms (±50ms random jitter)
+  - TX Power: -8 dBm (range ~10m indoors)
+  - Duration: Indefinite
+
+Motion-Boosted State (BOOST_ADV_FAST):
+  - Interval: 100ms
+  - TX Power: 0 dBm (range ~20m indoors)
+  - Duration: 10 seconds, then return to idle
+
+Connected State:
+  - Connection interval: 15-30ms (per Apple guidelines)
+  - Slave latency: 0 during streaming, up to 4 when idle
+  - Supervision timeout: 4 seconds
+
+
+================================================================================
+13. MINIMUM VIABLE DATA (MVP PROTOTYPE)
+================================================================================
+
+For the first "production-ish" prototype, minimize complexity while still
+proving value. Here's what to include:
+
+MVP DATA PACKET (20 bytes)
+--------------------------
+  Byte 0-3:   Timestamp (ms, uint32)      - When sample was taken
+  Byte 4-7:   Force (kg, float32)         - Calibrated load cell reading
+  Byte 8-9:   Accel X (milli-g, int16)    - Accelerometer X
+  Byte 10-11: Accel Y (milli-g, int16)    - Accelerometer Y
+  Byte 12-13: Accel Z (milli-g, int16)    - Accelerometer Z
+  Byte 14-15: Gyro X (0.1 deg/s, int16)   - Gyroscope X
+  Byte 16-17: Gyro Y (0.1 deg/s, int16)   - Gyroscope Y
+  Byte 18-19: Gyro Z (0.1 deg/s, int16)   - Gyroscope Z
+
+SAMPLE RATE: 50 Hz (20ms between samples)
+TRANSMISSION: One packet per sample, or batch 5 samples (100 bytes) per notify
+
+WHAT THIS PROVES
+----------------
+1. Force measurement works and is accurate
+2. BLE streaming is reliable
+3. IMU data correlates with movement
+4. System can capture a full workout
+
+WHAT THIS DEFERS
+----------------
+- Rep detection (do on phone for now)
+- Edge processing (phone calculates metrics)
+- Unclaimed rep storage (require connection)
+- Power optimization beyond basic sleep
+
+WHY DEFER?
+----------
+- Faster to market with simple device
+- Phone processing is flexible (update without DFU)
+- Learn from real data before committing to on-device algorithms
+- Power optimization can come after product-market fit
+
+MVP SUCCESS METRICS
+-------------------
+1. Capture 10 sets of 10 reps with no data loss
+2. Force accuracy within 5% of machine weight stack indicator
+3. App displays live force curve that "looks right"
+4. User can complete workout without device issues
+
+
+================================================================================
+14. TOP TECHNICAL RISKS & MITIGATIONS
+================================================================================
+
+RISK 1: HX711 ELECTRICAL NOISE
+------------------------------
+Severity: HIGH
+Description: The HX711 amplifies tiny signals (microvolts). Electrical noise
+  from gym equipment, LED lights, or the MCU itself can corrupt readings.
+
+Symptoms:
+  - Noisy force readings
+  - Drift over time
+  - Jumps or spikes in data
+
+Mitigations:
+  - Use shielded cable for load cell connection
+  - Keep HX711 wires short (<10cm if possible)
+  - Add 0.1µF capacitors at HX711 power pins
+  - Software filtering (EMA or median filter)
+  - Sample multiple times and average
+  - Shield the entire assembly if needed
+
+Test: Read force with no load for 1 minute. Noise should be <0.1 kg peak-to-peak.
+
+RISK 2: RF SHADOWING FROM STEEL WEIGHT STACK
+--------------------------------------------
+Severity: HIGH
+Description: The steel weight stack acts as a radio shield. If the device
+  antenna is behind the stack (from phone's perspective), signal may be blocked.
+
+Symptoms:
+  - Weak or no BLE connection
+  - High packet loss
+  - Works in lab, fails in gym
+
+Mitigations:
+  - Mount device where antenna has clear path (not blocked by steel)
+  - Use external antenna routed to better position
+  - Test in actual gym during installation
+  - Increase TX power if needed (costs battery)
+  - Consider device orientation requirements
+
+Test: Place device behind steel plate, measure signal strength vs. open air.
+
+RISK 3: BATTERY LIFE NOT MEETING TARGETS
+----------------------------------------
+Severity: HIGH
+Description: If idle current is too high, battery dies in weeks instead of months.
+
+Symptoms:
+  - Device dead when user returns
+  - Frequent battery replacements needed
+
+Mitigations:
+  - Measure current in each state with proper equipment
+  - Use Nordic Power Profiler Kit II
+  - Identify and eliminate current hogs
+  - Ensure all unused peripherals are disabled
+  - Verify pull-up/pull-down resistor configurations
+  - Test with actual target battery
+
+Test: Measure idle current. Target: <15µA. If higher, profile and fix.
+
+RISK 4: BLE CONNECTION LATENCY IN CROWDED RF ENVIRONMENT
+---------------------------------------------------------
+Severity: MEDIUM
+Description: In a gym with many devices (phones, smartwatches, other StrongTrak
+  units), BLE discovery and connection may be slow or unreliable.
+
+Symptoms:
+  - Long time to connect
+  - Connection drops frequently
+  - Works at home, struggles at gym
+
+Mitigations:
+  - Use unique device names/IDs for filtering
+  - Implement reconnection logic
+  - Use faster advertising on motion
+  - Test in actual gym environment
+  - Consider dedicated advertising channels
+
+Test: Place 5+ BLE devices in room, verify can still connect in <5 seconds.
+
+RISK 5: LOAD CELL CALIBRATION DRIFT
+-----------------------------------
+Severity: MEDIUM
+Description: Load cells can drift with temperature, mechanical settling, or
+  fatigue. Calibration done at install may not hold over time.
+
+Symptoms:
+  - Force readings incorrect after days/weeks
+  - Zero offset drifts
+  - Scale factor changes
+
+Mitigations:
+  - Use high-quality load cell rated for application
+  - Implement easy re-tare (user can zero via app)
+  - Store calibration with temperature compensation if needed
+  - Periodic recalibration recommendation in app
+
+Test: Calibrate, wait 1 week, verify still accurate with known weight.
+
+RISK 6: INSTALLATION SAFETY / LOAD PATH INTEGRITY
+-------------------------------------------------
+Severity: HIGH (SAFETY!)
+Description: The device is in the load path. If it fails mechanically, weight
+  could drop, causing injury.
+
+Symptoms:
+  - Mechanical failure under load
+  - Connector loosening over time
+  - Cable abrasion at connection point
+
+Mitigations:
+  - Over-engineer mechanical connection (use rated hardware)
+  - Use safety factor of 5x+ on all load-bearing components
+  - Professional installation only (not user-installed)
+  - Regular inspection protocol
+  - Consider fail-safe design (if device fails, weight stays attached)
+  - Liability/insurance considerations
+
+Test: Load test to 3x rated capacity. Fatigue test with 10,000 cycles.
+
+RISK 7: IMU POSITION TRACKING DRIFT
+-----------------------------------
+Severity: LOW (if used correctly)
+Description: Double-integrating accelerometer data accumulates error quickly.
+  Position estimate drifts unbounded without external reference.
+
+Symptoms:
+  - Position says 10 meters when device moved 1 meter
+  - Drift accelerates over time
+
+Mitigations:
+  - Only use for short-term / relative measurements
+  - Implement ZUPT (Zero Velocity Update) when stationary
+  - Reset/tare frequently
+  - Use for gesture detection, not absolute position
+  - Consider: is position tracking actually needed for StrongTrak?
+
+Assessment: For rep detection, you likely need force + motion detection, not
+  absolute position. The IMU is useful for direction/velocity during rep,
+  not tracking where the device is in space.
+
+
+================================================================================
+15. BEST PRACTICES FOR NOVICE EMBEDDED DEVELOPMENT
+================================================================================
+
+CODE ORGANIZATION
+-----------------
+1. ONE RESPONSIBILITY PER FILE
+   Each .h/.cpp pair should do ONE thing. If a file is doing multiple things,
+   split it. Examples:
+   - loadcell.h: Only load cell operations
+   - ble_streaming.h: Only BLE data transmission
+   
+2. PREFER NAMESPACES OVER CLASSES (for simple modules)
+   You're doing this already (imu::, teleplot::). It's simpler than classes
+   when you don't need multiple instances.
+   
+3. AVOID GLOBAL STATE where possible
+   If you need globals, put them in an anonymous namespace in the .cpp file
+   (static linkage) and expose via getter functions.
+
+4. USE const AND constexpr LIBERALLY
+   If a value doesn't change, mark it const. If it's known at compile time,
+   use constexpr. This catches bugs and enables optimization.
+
+   // Bad
+   int sampleRate = 50;
+   
+   // Good
+   static constexpr int kSampleRate = 50;
+
+NAMING CONVENTIONS
+------------------
+1. FILES: lowercase_with_underscores.cpp
+   (or lowercase.cpp - pick one and be consistent)
+
+2. NAMESPACES: lowercase (e.g., imu::, teleplot::)
+
+3. FUNCTIONS: camelCase or lowercase_with_underscores (pick one!)
+   e.g., imu::begin(), loadcell::readForce()
+
+4. CONSTANTS: kPascalCase or ALL_CAPS
+   e.g., kSampleIntervalMs, MAX_BUFFER_SIZE
+
+5. TYPES/STRUCTS: PascalCase
+   e.g., SmoothingConfig, Reading
+
+6. MEMBER VARIABLES: m_camelCase or trailing_underscore_
+   e.g., m_calibrationOffset or calibration_offset_
+
+7. LOCAL VARIABLES: camelCase
+   e.g., currentForce, elapsedMs
+
+PICK A STYLE AND STICK TO IT. Consistency matters more than which style.
+
+STATE MACHINES
+--------------
+Use explicit state machines instead of complex boolean flags.
+
+// Bad
+bool isConnected;
+bool isStreaming;
+bool isCalibrating;
+bool isMotionDetected;
+// ... 16 possible combinations, most invalid
+
+// Good
+enum class State {
+  IDLE_ADV_SLOW,
+  BOOST_ADV_FAST,
+  CONNECTED,
+  STREAMING,
+  CALIBRATING,
+  ERROR
+};
+State currentState = State::IDLE_ADV_SLOW;
+
+Transition between states in one place (a switch statement or state table).
+
+AVOID BLOCKING DELAYS
+---------------------
+Never use delay() in loop() for anything but debugging.
+Use millis() and non-blocking patterns.
+
+// Bad (blocks everything)
+void loop() {
+  readSensor();
+  delay(20);  // Nothing else can happen for 20ms!
+}
+
+// Good (non-blocking)
+void loop() {
+  uint32_t now = millis();
+  if (now - lastSampleMs >= 20) {
+    lastSampleMs = now;
+    readSensor();
+  }
+  // Other things can happen here
+}
+
+LOGGING WITHOUT DESTROYING BATTERY
+----------------------------------
+Serial output costs power and time. In production, minimize logging.
+
+// Development: verbose logging
+#define DEBUG_LOG 1
+
+#if DEBUG_LOG
+  #define LOG(msg) Serial.println(msg)
+#else
+  #define LOG(msg) ((void)0)  // Compiles to nothing
+#endif
+
+Or use log levels:
+enum LogLevel { NONE, ERROR, WARN, INFO, DEBUG };
+void log(LogLevel level, const char* msg);
+
+In production, set level to ERROR or NONE.
+
+WHAT NOT TO DO
+--------------
+1. DON'T USE String CLASS for anything performance-critical
+   Arduino String causes heap fragmentation. Use char[] and snprintf().
+   
+   // Bad
+   String message = "Force: " + String(force) + " kg";
+   
+   // Good
+   char buffer[32];
+   snprintf(buffer, sizeof(buffer), "Force: %.2f kg", force);
+
+2. DON'T ALLOCATE MEMORY DYNAMICALLY after setup()
+   malloc/new in loop() will eventually fragment memory and crash.
+   Pre-allocate buffers at compile time or in setup().
+
+3. DON'T IGNORE RETURN VALUES
+   If a function returns bool for success/failure, CHECK IT.
+
+   // Bad
+   ble::init();  // Ignoring return value
+   
+   // Good
+   if (!ble::init()) {
+     enterErrorState();
+   }
+
+4. DON'T BLOCK IN CALLBACKS
+   BLE event callbacks must return quickly. Don't do heavy processing there.
+   Set a flag and handle in loop().
+
+5. DON'T TRUST FLOATING POINT EQUALITY
+   
+   // Bad
+   if (force == 0.0f) { ... }
+   
+   // Good
+   if (fabs(force) < 0.001f) { ... }
+
+6. DON'T FORGET TO HANDLE WRAPAROUND
+   millis() wraps around every ~49 days. Use subtraction, not comparison.
+   
+   // Bad (breaks at wraparound)
+   if (millis() > lastTime + interval) { ... }
+   
+   // Good (always works)
+   if (millis() - lastTime >= interval) { ... }
+
+TESTABILITY
+-----------
+1. PURE FUNCTIONS when possible
+   A function that takes inputs and returns outputs without side effects is
+   easy to test.
+
+   // Easy to test
+   float applyEMA(float current, float previous, float alpha);
+   
+   // Hard to test (depends on hardware)
+   float readLoadCell();
+
+2. DEPENDENCY INJECTION (simple version)
+   Pass interfaces to functions instead of hardcoding hardware calls.
+   
+   // Hard to test
+   void processForce() {
+     float f = hx711.read();  // Hardcoded to real hardware
+     ...
+   }
+   
+   // Easier to test
+   void processForce(float rawForce) {  // Pass the value in
+     ...
+   }
+
+3. NATIVE UNIT TESTS
+   PlatformIO supports [env:native] for running tests on your PC.
+   Test algorithms without needing hardware.
+
+
+================================================================================
+16. ASSUMPTIONS & CONSTRAINTS
+================================================================================
+
+ASSUMPTIONS MADE IN THIS DOCUMENT
+---------------------------------
+1. Target load cell capacity: 0-200 kg
+2. Target advertising interval (idle): 3 seconds
+3. Target battery life: 6+ months with reasonable usage
+4. Target sample rate: 50 Hz IMU, 10-80 Hz load cell
+5. Device is installed by trained personnel, not end users
+6. Phone app will be iOS and Android (React Native or Flutter likely)
+7. Backend will be cloud-hosted (AWS, GCP, or Azure)
+8. Initial launch is single-gym pilot, then scale to multi-gym
+
+HARD CONSTRAINTS
+----------------
+1. Device MUST be in load path (inline between cable and stack)
+2. Battery power only (no wall power available)
+3. Must work in gym RF environment (steel, EMI, crowded BLE)
+4. User identity NOT stored on device (privacy requirement)
+5. QR code is on machine, not on device
+
+SOFT CONSTRAINTS (PREFERENCES)
+------------------------------
+1. Prefer CR2450/CR123 primary cell over rechargeable LiPo
+   (Rationale: No charging infrastructure needed)
+   (Counter: Rechargeable may be needed for power budget)
+
+2. Prefer Arduino framework over bare-metal
+   (Rationale: Library support, faster development, handoff-friendly)
+
+3. Prefer proven libraries over custom implementations
+   (Unless library is problematic - see HX711 discussion)
+
+
+================================================================================
+17. HANDOFF NOTES FOR FUTURE ENGINEERS
+================================================================================
+
+FOR THE EMBEDDED ENGINEER WHO INHERITS THIS
+-------------------------------------------
+
+WHAT'S WORKING (as of December 2025):
+- IMU streaming with auto-detection (LSM6DS variants)
+- BLE NUS transmission
+- EMA smoothing
+- Basic position tracking (experimental, drifts)
+- Modular code structure
+
+WHAT'S NOT YET IMPLEMENTED:
+- HX711 load cell integration
+- Custom GATT service
+- Power optimization
+- Rep detection
+- Flash storage
+- DFU/FUOTA
+
+KNOWN QUIRKS:
+- Must double-tap RESET for reliable upload (bootloader entry)
+- Windows serial requires RTS/DTR asserted
+- Header named "bleservice.h" to avoid Nordic SDK conflict
+
+WHERE TO START:
+1. Read PROJECT_SUMMARY.txt for completed work and lessons learned
+2. Read this document for architecture and roadmap
+3. Start with Phase 1 (HX711 integration)
+
+CODE STYLE NOTES:
+- Namespaces for modules (imu::, teleplot::, etc.)
+- Non-blocking loop with millis()-based timing
+- State machine in progress (implicit in main.cpp, needs explicit module)
+
+QUESTIONS FOR THE BUSINESS TEAM:
+1. Final battery type decision (primary vs. rechargeable)
+2. Target price point (affects component choices)
+3. Installation service model (who installs devices)
+4. Regulatory requirements (CE, FCC, etc.)
+5. Data privacy requirements (GDPR, etc.)
+
+
+================================================================================
+18. AGENTIC CODING GUIDELINES (FOR AI ASSISTANTS)
+================================================================================
+
+This section provides rules and context for AI coding assistants (GitHub Copilot,
+Claude, GPT, etc.) working on this project. Read this section at the start of
+every coding session.
+
+------------------------------------------------------------------------------
+PROJECT CONTEXT FOR AI AGENTS
+------------------------------------------------------------------------------
+
+WHAT THIS PROJECT IS:
+StrongTrak is embedded firmware for a gym equipment sensor device. It runs on
+an Adafruit Feather nRF52840 Sense board and will eventually be a production
+IoT product. The firmware measures force (load cell) and motion (IMU), streams
+data over BLE to a phone app, and must achieve extreme low power consumption.
+
+WHO THE USER IS:
+The primary developer is a capable product/industrial designer but a NOVICE
+embedded programmer. They need:
+- Jargon explained on first use
+- Rationale for technical decisions
+- "Training wheels" - don't assume deep C++ or embedded knowledge
+- Clear warnings about footguns and common mistakes
+
+CURRENT PHASE:
+Check the PHASED ROADMAP section to understand what's already done and what's
+next. As of initial writing (December 2025), the project is in Phase 0/1
+transition (IMU working, HX711 integration next).
+
+------------------------------------------------------------------------------
+CRITICAL RULES FOR AI AGENTS
+------------------------------------------------------------------------------
+
+RULE 1: ALWAYS PROMPT FOR BOOTLOADER MODE BEFORE UPLOAD
+When running upload commands, ALWAYS use this pattern:
+
+  Write-Host "Double-tap the RESET button on your Feather now, then press Enter to upload..."
+  Read-Host
+  & "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run -t upload
+
+NEVER skip the bootloader prompt. The nRF52840 USB bootloader re-enumerates
+and uploads fail without manual bootloader entry.
+
+RULE 2: USE FULL PATH TO PIO.EXE
+The PATH may not include PlatformIO. Always use:
+  C:\Users\Computer\.platformio\penv\Scripts\pio.exe
+Or the environment variable form:
+  $env:USERPROFILE\.platformio\penv\Scripts\pio.exe
+
+RULE 3: AVOID NAMING CONFLICTS WITH NORDIC SDK
+NEVER name a header file any of these (Nordic SDK uses them internally):
+  - ble.h
+  - ble_gap.h
+  - ble_gatt.h
+  - ble_types.h
+  - nrf_error.h
+Use descriptive prefixes: bleservice.h, strongtrak_ble.h, etc.
+
+RULE 4: MAINTAIN MODULAR ARCHITECTURE
+Follow the existing module pattern:
+  - Each feature in its own namespace (imu::, teleplot::, ble::, position::)
+  - Each module has .h and .cpp in src/
+  - Public API in header, implementation details in .cpp
+  - No cross-dependencies between modules where possible
+
+RULE 5: NON-BLOCKING CODE ONLY
+NEVER use delay() in loop() except for debugging.
+Use millis()-based timing:
+  if (millis() - lastTimeMs >= intervalMs) {
+    lastTimeMs = millis();
+    // do work
+  }
+
+RULE 6: SERIAL REQUIRES RTS/DTR ON WINDOWS
+If serial output appears dead, remind user that Windows USB-CDC requires
+RTS/DTR asserted. The platformio.ini already has:
+  monitor_rts = 1
+  monitor_dtr = 1
+But third-party serial tools may need manual configuration.
+
+RULE 7: EXPLAIN ACRONYMS ON FIRST USE
+The user is learning embedded development. Always explain:
+  - BLE (Bluetooth Low Energy)
+  - IMU (Inertial Measurement Unit)
+  - ADC (Analog-to-Digital Converter)
+  - GPIO (General Purpose Input/Output)
+  - etc.
+Check the GLOSSARY section for standard definitions.
+
+RULE 8: PREFER SAFETY OVER CLEVERNESS
+This device is in the load path of gym equipment. Prioritize:
+  - Clear, readable code over clever optimizations
+  - Defensive programming (check return values, validate inputs)
+  - Fail-safe behavior (errors should be visible, not silent)
+
+RULE 9: POWER AWARENESS
+Every feature decision should consider power impact:
+  - Avoid unnecessary sensor polling
+  - Use interrupts for wake, not polling
+  - Power down peripherals when not in use
+  - Log power implications when adding features
+
+RULE 10: TEST INCREMENTALLY
+After any change:
+  1. Build (pio run) - verify no compile errors
+  2. Upload (with bootloader prompt) - verify upload succeeds
+  3. Monitor (pio device monitor) - verify expected output
+  4. Test the specific feature changed
+
+------------------------------------------------------------------------------
+CODE STYLE RULES FOR AI AGENTS
+------------------------------------------------------------------------------
+
+FILE NAMING:
+  - Source files: lowercase with underscores (load_cell.cpp) or just lowercase
+  - Headers match source: load_cell.h
+  - Test files: test_<module>.cpp
+
+NAMING CONVENTIONS:
+  - Namespaces: lowercase (imu::, loadcell::, ble::)
+  - Functions: camelCase (readForce(), applyFilter())
+  - Constants: kPascalCase (kSampleIntervalMs)
+  - Types/Structs: PascalCase (SensorReading, Config)
+  - Local variables: camelCase (currentForce, elapsedMs)
+  - Static file-scope: s_camelCase (s_lastSampleMs)
+
+HEADER GUARDS:
+Use #pragma once (simpler than #ifndef guards)
+
+INCLUDES:
+Order includes as:
+  1. Corresponding header (for .cpp files)
+  2. Arduino/system headers
+  3. Library headers
+  4. Project headers
+
+COMMENTS:
+  - File header: brief description of purpose
+  - Function docs: only if non-obvious
+  - Inline: explain WHY, not WHAT
+
+ERROR HANDLING:
+  - Return bool for success/failure
+  - Use teleplot::log() for errors
+  - Never silently fail
+
+------------------------------------------------------------------------------
+COMMON TASKS AND PATTERNS
+------------------------------------------------------------------------------
+
+ADDING A NEW SENSOR MODULE:
+1. Create src/sensors/newsensor.h with:
+   - #pragma once
+   - namespace newsensor { ... }
+   - bool begin(); 
+   - bool read(Reading& out);
+   
+2. Create src/sensors/newsensor.cpp implementing the namespace
+
+3. In main.cpp:
+   - #include "sensors/newsensor.h"
+   - Call newsensor::begin() in setup()
+   - Call newsensor::read() in loop() at appropriate interval
+
+4. Add any new libraries to platformio.ini lib_deps
+
+ADDING A BLE CHARACTERISTIC:
+1. Define UUID in ble_service.h
+2. Create characteristic in ble_service.cpp init
+3. Add send function for the data type
+4. Call from main.cpp or relevant module
+
+ADDING A CONFIG PARAMETER:
+1. Add to relevant Config struct (e.g., imu::SmoothingConfig)
+2. Provide sensible default value
+3. Document units and valid range in comment
+4. Consider if it needs flash storage for persistence
+
+DEBUGGING A HANG/CRASH:
+1. Add teleplot::log() statements to narrow down location
+2. Check for blocking code (delay(), while loops without timeout)
+3. Check for null pointer dereference
+4. Check for stack overflow (reduce local array sizes)
+5. Check for infinite recursion
+
+------------------------------------------------------------------------------
+PHASE-SPECIFIC GUIDANCE
+------------------------------------------------------------------------------
+
+PHASE 1 (HX711 LOAD CELL):
+- Create src/sensors/loadcell.h and loadcell.cpp
+- HX711 uses bit-banging (toggle GPIO manually), not I2C
+- Pins needed: DOUT (data in), SCK (clock out), VCC, GND
+- Power-down HX711 by holding SCK high for >60µs
+- Implement tare (zero offset) and calibration (scale factor)
+- Store calibration to flash using Preferences library
+
+PHASE 2 (BLE PACKETS):
+- Define binary struct for sensor data
+- Pack data efficiently (int16 for scaled values)
+- Handle MTU negotiation (request 247 bytes)
+- Add sequence number for packet loss detection
+
+PHASE 3 (POWER):
+- Measure current with Power Profiler Kit or multimeter
+- Implement state machine in src/power/state_machine.h
+- Configure IMU motion interrupt for wake
+- Test each state's current draw separately
+
+PHASE 4 (REP DETECTION):
+- Create src/processing/rep_detector.h
+- Use force threshold + derivative for rep boundaries
+- Buffer raw data for a few samples for filtering
+- Emit rep events, not continuous data
+
+------------------------------------------------------------------------------
+WHEN STUCK, TRY THESE
+------------------------------------------------------------------------------
+
+BUILD FAILS:
+1. Read the FIRST error (later errors cascade)
+2. Check for typos in includes
+3. Check for missing namespace qualifiers
+4. Verify library is in lib_deps
+5. Try: pio run -t clean && pio run
+
+UPLOAD FAILS:
+1. Is device in bootloader mode? (Double-tap RESET, red LED pulses)
+2. Is COM port correct? Check Device Manager
+3. Is another program holding the port? Close monitors/terminals
+4. Try different USB cable (some are charge-only)
+
+NO SERIAL OUTPUT:
+1. Is monitor_rts/dtr set in platformio.ini?
+2. Is baud rate correct (115200)?
+3. Is Serial.begin() called in setup()?
+4. Is there an early crash before Serial.begin()?
+
+BLE NOT ADVERTISING:
+1. Check Bluefruit.begin() return value
+2. Check Bluefruit.Advertising.start() called
+3. Verify not already connected (only one connection at a time)
+4. Try power cycling the device
+
+SENSOR READS GARBAGE:
+1. Check I2C address (use I2C scanner sketch)
+2. Check wiring (SDA, SCL, VCC, GND)
+3. Check sensor begin() return value
+4. Try slower I2C clock (Wire.setClock(100000))
+
+------------------------------------------------------------------------------
+REMINDERS FOR EVERY SESSION
+------------------------------------------------------------------------------
+
+AT START OF SESSION:
+[ ] Read PROJECT_SUMMARY.txt for recent changes
+[ ] Read this section for rules and context
+[ ] Understand current phase in roadmap
+[ ] Check for any TODO comments in code
+
+BEFORE EACH CODE CHANGE:
+[ ] Understand the existing module structure
+[ ] Plan where new code should go
+[ ] Consider power implications
+[ ] Consider error handling
+
+AFTER EACH CODE CHANGE:
+[ ] Build and fix any errors
+[ ] Upload with bootloader prompt
+[ ] Test the changed feature
+[ ] Verify no regressions in other features
+
+AT END OF SESSION:
+[ ] Update PROJECT_SUMMARY.txt if significant changes
+[ ] Leave code in buildable state
+[ ] Note any TODO items for next session
+
+
+================================================================================
+                              END OF DOCUMENT
+================================================================================

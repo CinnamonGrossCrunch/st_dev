@@ -1,0 +1,16 @@
+{
+    "github.copilot.chat.codeGeneration.instructions": [
+        {
+            "text": "Before making changes, read STRONGTRAK_ARCHITECTURE.txt (especially Section 18: Agentic Coding Guidelines) and PROJECT_SUMMARY.txt for project context, conventions, and lessons learned."
+        },
+        {
+            "text": "Always prompt user to double-tap RESET button before uploading firmware."
+        },
+        {
+            "text": "Use full path to PlatformIO: $env:USERPROFILE\\.platformio\\penv\\Scripts\\pio.exe"
+        },
+        {
+            "text": "User is a novice embedded programmer - explain jargon and provide rationale."
+        }
+    ]
+}

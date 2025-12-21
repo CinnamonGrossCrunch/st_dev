@@ -1,0 +1,211 @@
+================================================================================
+                        STRONGTRAK TEST - PROJECT SUMMARY
+                            December 20, 2025
+================================================================================
+
+PROJECT OVERVIEW
+--------------------------------------------------------------------------------
+StrongTrak Test is an embedded firmware project for the Adafruit Feather 
+nRF52840 Sense development board. The project demonstrates real-time IMU 
+(Inertial Measurement Unit) data streaming, BLE wireless transmission, and 
+relative position tracking using double integration of accelerometer data.
+
+The firmware is built using PlatformIO with the Arduino framework targeting 
+Nordic nRF52840 Bluetooth SoC.
+
+
+HARDWARE PLATFORM
+--------------------------------------------------------------------------------
+Board:        Adafruit Feather nRF52840 Sense
+MCU:          Nordic nRF52840 (ARM Cortex-M4F @ 64 MHz)
+IMU:          LSM6DS3TR-C (6-axis accelerometer + gyroscope)
+Magnetometer: LIS3MDL (3-axis)
+Connectivity: Bluetooth Low Energy 5.0, USB-CDC Serial
+Bootloader:   UF2 Bootloader 0.8.0
+
+Note: Newer board revisions use LSM6DS3TR-C instead of LSM6DS33. The firmware 
+auto-detects the IMU variant via WHO_AM_I register probing.
+
+
+ACCOMPLISHMENTS
+--------------------------------------------------------------------------------
+
+1. CORE IMU STREAMING (50 Hz)
+   - Reads accelerometer (±4g), gyroscope (±500 dps), and magnetometer data
+   - Outputs temperature from IMU
+   - Auto-detects LSM6DS variants (LSM6DS33, LSM6DS3, LSM6DS3TR-C) at runtime
+   - Streams data via USB-Serial at 115200 baud
+
+2. TELEPLOT INTEGRATION
+   - Real-time visualization in VS Code using Teleplot extension
+   - Custom output format: ">channel_name:value" for live plotting
+   - Channels: acc_g_x/y/z, gyro_dps_x/y/z, imu_temp_C, mag_uT_x/y/z
+   - Optional PowerShell UDP bridge for RTS/DTR workarounds
+
+3. MODULAR CODE ARCHITECTURE
+   - Vertically-sliced module structure for scalability:
+     * imu.h/cpp      - Sensor abstraction with auto-detection
+     * teleplot.h/cpp - Teleplot output helpers (emit, emitVec3, log)
+     * bleservice.h/cpp - BLE UART service wrapper
+     * position.h/cpp - Position tracking via integration
+   - Clean namespace isolation (imu::, teleplot::, ble::, position::)
+   - Main.cpp serves as lightweight orchestrator
+
+4. BLE WIRELESS TRANSMISSION (10 Hz)
+   - Nordic UART Service (NUS) for wireless data streaming
+   - Advertises as "StrongTrak"
+   - Compatible with iOS/Android Bluefruit Connect and nRF Connect apps
+   - Transmits formatted strings: "A:x,y,z", "G:x,y,z", "P:x,y,z"
+   - Successfully tested with iOS Bluefruit Connect app
+
+5. EMA SIGNAL SMOOTHING
+   - Exponential Moving Average (EMA) filtering for all sensor axes
+   - Configurable alpha values per sensor type:
+     * Accelerometer: α = 0.25 (faster response)
+     * Gyroscope:     α = 0.15 (vibration rejection)
+     * Magnetometer:  α = 0.08 (slow-changing field)
+   - Runtime enable/disable with custom parameters
+
+6. RELATIVE POSITION TRACKING
+   - Double-integration of accelerometer data (accel → velocity → position)
+   - Gravity compensation using tare reference
+   - Zero-Velocity Update (ZUPT) for drift reduction:
+     * Detects stationary state via acceleration variance
+     * Auto-zeros velocity when device is still
+   - Tares on boot after 500ms sensor settle time
+   - Outputs position (meters) and velocity (m/s) to Teleplot and BLE
+   - Best suited for short-term tracking (<10s) or gesture detection
+
+
+CHALLENGES OVERCOME
+--------------------------------------------------------------------------------
+
+1. SERIAL OUTPUT DEAD ON WINDOWS
+   Problem:  No serial output appeared after flashing; device seemed
+             unresponsive despite successful upload.
+   Root Cause: Windows USB-CDC requires RTS (Request To Send) and DTR 
+             (Data Terminal Ready) signals to be asserted before the 
+             device will transmit.
+   Solution: Added `monitor_rts = 1` and `monitor_dtr = 1` to platformio.ini.
+             Created PowerShell UDP bridge as fallback for Teleplot.
+
+2. IMU INITIALIZATION FAILURE (WRONG SENSOR VARIANT)
+   Problem:  IMU at I²C address 0x6A failed to initialize with LSM6DS33 driver.
+   Root Cause: Newer Feather Sense boards ship with LSM6DS3TR-C (WHO_AM_I = 0x6A)
+             instead of LSM6DS33 (WHO_AM_I = 0x69).
+   Solution: Implemented WHO_AM_I register probing to auto-detect the correct
+             LSM6DS variant at runtime. Tries LSM6DS3TRC, LSM6DS3, then LSM6DS33.
+
+3. BLE COMPILATION FAILURE (HEADER CONFLICT)
+   Problem:  Build failed with cryptic type errors in Nordic SoftDevice SDK.
+   Root Cause: Our file was named `ble.h`, which conflicted with Nordic SDK's 
+             internal `ble.h` header. The include order caused SDK files to
+             pull our header instead of theirs.
+   Solution: Renamed `ble.h` → `bleservice.h` and `ble.cpp` → `bleservice.cpp`.
+             Documented the naming constraint in comments.
+
+4. UPLOAD FAILURES / COM PORT ENUMERATION
+   Problem:  PlatformIO upload would fail intermittently; COM port would
+             change or disappear during upload.
+   Root Cause: The nRF52840's USB bootloader re-enumerates the USB device
+             when entering DFU mode, causing Windows to assign a new COM port.
+   Solution: Established reliable upload workflow:
+             - Always double-tap RESET button to enter bootloader mode
+             - Wait for red LED to pulse (confirms bootloader active)
+             - Interactive prompt before upload command
+             This is now the STANDARD procedure, not a fallback.
+
+5. LIBRARY VERSION MISMATCHES
+   Problem:  Initial library versions were incompatible or caused compile errors.
+   Root Cause: PlatformIO registry versions differ from Arduino Library Manager.
+   Solution: Searched PlatformIO registry for exact library names and pinned
+             specific versions: LSM6DS @ 4.7.4, LIS3MDL @ 1.2.5, etc.
+
+6. POSITION DRIFT IN IMU INTEGRATION
+   Problem:  Double-integrating accelerometer data leads to unbounded drift
+             due to sensor bias and noise accumulation.
+   Root Cause: Inherent limitation of dead-reckoning without external references.
+   Solution: Implemented Zero-Velocity Update (ZUPT):
+             - Monitor acceleration variance over sliding window
+             - When variance below threshold, device is stationary
+             - Reset velocity to zero during stationary periods
+             This bounds drift and works well for gesture/short-term tracking.
+
+
+MEMORY USAGE
+--------------------------------------------------------------------------------
+Flash: 145,816 bytes (17.9% of 815,104 bytes)
+RAM:    16,616 bytes (6.7% of 248,832 bytes)
+
+
+PROJECT STRUCTURE
+--------------------------------------------------------------------------------
+strongtrak_test/
+├── platformio.ini          # Build config, library deps, monitor settings
+├── README.md               # User documentation
+├── PROJECT_SUMMARY.txt     # This file
+├── src/
+│   ├── main.cpp            # Entry point, timing loops, orchestration
+│   ├── imu.h / imu.cpp     # IMU + magnetometer with EMA smoothing
+│   ├── teleplot.h / .cpp   # Serial output for Teleplot visualization
+│   ├── bleservice.h / .cpp # BLE UART service (Nordic NUS)
+│   └── position.h / .cpp   # Relative position tracking
+├── tools/
+│   └── serial_to_teleplot_udp.ps1  # Optional Serial→UDP bridge
+├── include/                # (empty, for user headers)
+├── lib/                    # (empty, for private libraries)
+└── test/                   # (empty, for unit tests)
+
+
+TECHNICAL STACK
+--------------------------------------------------------------------------------
+Platform:     PlatformIO (nordicnrf52 @ 10.10.0)
+Framework:    Arduino (framework-arduinoadafruitnrf52 @ 1.7.0)
+Libraries:
+  - Adafruit LSM6DS @ 4.7.4     (6-axis IMU driver)
+  - Adafruit LIS3MDL @ 1.2.5    (Magnetometer driver)
+  - Adafruit BusIO @ 1.17.4     (I²C/SPI abstraction)
+  - Adafruit Unified Sensor @ 1.1.15
+  - Bluefruit52Lib              (BLE stack, bundled with framework)
+
+Visualization: Teleplot VS Code Extension (alexnesnes.teleplot)
+Mobile App:    Bluefruit Connect (iOS/Android) or nRF Connect
+
+
+FUTURE ENHANCEMENTS (POTENTIAL)
+--------------------------------------------------------------------------------
+- Button-triggered re-tare for position reset
+- Complementary or Kalman filter for orientation estimation
+- Sensor fusion (accel + gyro + mag) for heading
+- Data logging to onboard flash (LittleFS)
+- Serial command interface for runtime configuration
+- Battery voltage monitoring via ADC
+
+
+KEY LESSONS LEARNED
+--------------------------------------------------------------------------------
+1. Windows USB-CDC serial requires RTS/DTR to be asserted for data flow.
+2. Nordic SDK has reserved header names - avoid naming conflicts.
+3. Always enter bootloader mode manually for reliable uploads on nRF52840.
+4. WHO_AM_I probing is essential for hardware revision compatibility.
+5. EMA filtering is simple and effective for noisy sensor data.
+6. Dead-reckoning position requires drift mitigation (ZUPT) to be useful.
+
+
+UPLOAD PROCEDURE (CRITICAL)
+--------------------------------------------------------------------------------
+ALWAYS manually enter bootloader mode before uploading:
+
+1. Double-tap the RESET button on the Feather
+2. Red LED should pulse (bootloader mode active)
+3. Run upload command and press Enter when prompted
+
+Command:
+  Write-Host "Double-tap the RESET button on your Feather now, then press Enter to upload..."
+  Read-Host
+  & "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run -t upload
+
+
+================================================================================
+                              END OF SUMMARY
+================================================================================
