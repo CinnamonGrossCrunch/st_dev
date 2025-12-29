@@ -99,6 +99,4 @@ Connect with the **nRF Connect** app (iOS/Android) to receive IMU data at 10 Hz.
 - Call `teleplot::emit()` / `emitVec3()` for any value you want to plot.
 - Use `teleplot::log()` / `logKV()` for console (non-plotted) messages.
 
-## License
 
-MIT – do what you want.

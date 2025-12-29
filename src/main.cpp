@@ -11,6 +11,7 @@
 #include "bleservice.h"
 #include "position.h"
 #include "battery.h"
+#include "loadcell.h"
 
 // ---- Timing configuration ----
 static constexpr uint32_t kSampleIntervalMs = 20;   // ~50 Hz
@@ -18,6 +19,7 @@ static constexpr uint32_t kHeartbeatIntervalMs = 1000;
 static constexpr uint32_t kStatusIntervalMs = 3000;
 static constexpr uint32_t kBleUpdateIntervalMs = 100;  // 10 Hz for BLE (conserve bandwidth)
 static constexpr uint32_t kBatteryIntervalMs = 5000;   // Battery check every 5 seconds (slow-changing)
+static constexpr uint32_t kLoadCellIntervalMs = 100;   // Load cell 10 Hz (HX711 is slow ~80Hz max)
 
 // ---- Timing state ----
 static uint32_t s_lastSampleMs = 0;
@@ -25,6 +27,7 @@ static uint32_t s_lastHeartbeatMs = 0;
 static uint32_t s_lastStatusMs = 0;
 static uint32_t s_lastBleUpdateMs = 0;
 static uint32_t s_lastBatteryMs = 0;
+static uint32_t s_lastLoadCellMs = 0;
 
 // ---- Serial command buffer ----
 static char s_cmdBuffer[32];
@@ -43,12 +46,46 @@ void processSerialCommands() {
         // Parse command (case-insensitive)
         if (strcasecmp(s_cmdBuffer, "tare") == 0) {
           position::tare();
-          teleplot::log("CMD: position tared");
+          if (loadcell::tare()) {
+            teleplot::log("CMD: position & load cell tared");
+          } else {
+            teleplot::log("CMD: position tared, load cell tare failed");
+          }
         } 
+        else if (strncasecmp(s_cmdBuffer, "cal ", 4) == 0) {
+          // Extract weight value (e.g., "cal 5" for 5 lbs)
+          float weight = atof(s_cmdBuffer + 4);
+          if (weight > 0.0f) {
+            if (loadcell::calibrate(weight)) {
+              float factor = loadcell::getCalibration();
+              int32_t offset = loadcell::getZeroOffset();
+              teleplot::log("CMD: calibration success");
+              teleplot::logKV("cal_factor", factor);
+              teleplot::logKV("zero_offset", offset);
+            } else {
+              teleplot::log("CMD: calibration failed (check weight is applied)");
+            }
+          } else {
+            teleplot::log("CMD: usage: cal <weight_lbs> (e.g., 'cal 5')");
+          }
+        }
         else if (strcasecmp(s_cmdBuffer, "help") == 0) {
-          teleplot::log("Commands: tare, help, status");
+          teleplot::log("Commands: tare, cal <lbs>, help, status");
         }
         else if (strcasecmp(s_cmdBuffer, "status") == 0) {
+          teleplot::log("=== Load Cell Status ===");
+          int32_t raw;
+          if (loadcell::readRaw(raw)) {
+            teleplot::logKV("loadcell_raw", raw);
+          }
+          teleplot::logKV("zero_offset", loadcell::getZeroOffset());
+          teleplot::logKV("cal_factor", loadcell::getCalibration());
+          float weight;
+          if (loadcell::read(weight)) {
+            teleplot::logKV("weight_lbs", weight);
+          } else {
+            teleplot::log("weight_lbs: [read failed]");
+          }
           teleplot::logKV("imu_ok", imu::imuOk() ? 1 : 0);
           teleplot::logKV("mag_present", imu::magOk() ? 1 : 0);
           teleplot::logKV("ble_connected", ble::isConnected() ? 1 : 0);
@@ -107,6 +144,29 @@ void setup() {
   teleplot::logKV("power_source", battery::isUsbPowered() ? "USB" : "BATTERY");
   teleplot::logKV("battery_status", battery::getStatusString());
 
+  // Initialize load cell
+  loadcell::Config lcCfg;
+  lcCfg.sckPin = 11;
+  lcCfg.dtPin = 12;
+  
+  // Debug: Check DT pin state before init
+  pinMode(12, INPUT);
+  int dtState = digitalRead(12);
+  teleplot::logKV("HX711_DT_pin_state", dtState);
+  teleplot::log(dtState == HIGH ? "DT is HIGH (not ready or no power)" : "DT is LOW (ready)");
+  
+  if (!loadcell::begin(lcCfg)) {
+    teleplot::log("WARN: Load cell init failed - timeout waiting for HX711");
+  } else {
+    teleplot::log("Load cell ready");
+    delay(500);
+    if (loadcell::tare()) {
+      teleplot::log("Load cell tared");
+    } else {
+      teleplot::log("WARN: Load cell tare failed");
+    }
+  }
+
   teleplot::log("stream:ready");
   teleplot::log("Type 'help' for commands");
 }
@@ -155,6 +215,47 @@ void loop() {
         teleplot::log("WARN: Battery CRITICAL (<5%)");
       } else if (battery::isLow()) {
         teleplot::log("WARN: Battery low (<10%)");
+      }
+    }
+  }
+
+  // Load cell reading
+  if ((nowMs - s_lastLoadCellMs) >= kLoadCellIntervalMs) {
+    s_lastLoadCellMs = nowMs;
+
+    // Track last time the HX711 was ready to avoid noisy warnings
+    static uint32_t lastReadyMs = 0;
+    static uint32_t lastWarnMs = 0;
+    if (lastReadyMs == 0) lastReadyMs = nowMs;  // initialize
+
+    if (loadcell::isReady()) {
+      lastReadyMs = nowMs;
+
+      int32_t raw;
+      if (loadcell::readRaw(raw)) {
+        // Always emit raw value for diagnostics (even if filtered out later)
+        teleplot::emit("loadcell_raw", (float)raw);
+        
+        // Log zero offset and calibration factor for debugging
+        static uint32_t lastDiagMs = 0;
+        if ((nowMs - lastDiagMs) > 2000) {  // Every 2 seconds
+          lastDiagMs = nowMs;
+          teleplot::logKV("zero_offset", loadcell::getZeroOffset());
+          teleplot::logKV("cal_factor", loadcell::getCalibration());
+        }
+
+        float weight_lbs;
+        if (loadcell::read(weight_lbs)) {
+          teleplot::emit("weight_lbs", weight_lbs);
+        }
+      }
+      // Removed error logging - bad reads are now silently filtered
+
+    } else {
+      // Only warn if we've been not-ready for >5s AND haven't recently warned
+      if ((nowMs - lastReadyMs) > 5000 && (nowMs - lastWarnMs) > 5000) {
+        teleplot::log("WARN: HX711 not ready (check wiring)");
+        lastWarnMs = nowMs;
       }
     }
   }
