@@ -15,22 +15,24 @@ struct Vec3 {
 // Configuration for drift reduction
 struct Config {
   // Stationary detection
-  float stationaryVarianceThreshold = 0.002f;  // g² - accel variance below this = stationary
+  float stationaryVarianceThreshold = 0.001f;  // g² - accel variance below this = stationary (tighter = less false positives)
   
   // Dead zone - ignore tiny accelerations (sensor noise)
-  float accelDeadZone = 0.03f;  // g - accelerations below this are zeroed
+  float accelDeadZone = 0.02f;  // g - accelerations below this are zeroed
   
   // Velocity decay - slowly reduce velocity when acceleration is small
-  float velocityDecayRate = 0.95f;  // per update (0.95 = 5% decay per 20ms)
-  float velocityDecayThreshold = 0.05f;  // g - decay velocity when accel magnitude below this
+  float velocityDecayRate = 0.98f;  // per update (0.98 = 2% decay per 20ms) - less aggressive
+  float velocityDecayThreshold = 0.03f;  // g - decay velocity when accel magnitude below this
   
   // ZUPT (Zero Velocity Update)
   bool enableZeroVelocityUpdate = true;
-  float zeroVelocityThreshold = 0.1f;  // m/s - force to zero when stationary and below this
+  float zeroVelocityThreshold = 0.05f;  // m/s - force to zero when stationary and below this
   
   // Position decay - pull position toward zero when stationary
+  // This is for LONG-TERM drift correction, not during a lift!
   bool enablePositionDecay = true;
-  float positionDecayRate = 0.98f;  // per update when stationary (0.98 = 2% decay per 20ms)
+  float positionDecayRate = 0.998f;  // per update when stationary (0.998 = 0.2% per 20ms, ~10% per second)
+  float positionDecayDelay = 1.0f;   // seconds - wait this long before starting position decay
 };
 
 // Initialize position tracking (call after imu::begin())

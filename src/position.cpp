@@ -22,6 +22,7 @@ static uint32_t s_lastUpdateMs = 0;
 static float s_accelHistory[10] = {0};
 static uint8_t s_accelHistoryIdx = 0;
 static bool s_isStationary = false;
+static uint32_t s_stationaryStartMs = 0;  // When we first became stationary
 
 // Flag to recapture gravity reference on next update
 static bool s_needsGravityCapture = true;
@@ -124,7 +125,7 @@ uint32_t update(float acc_x_g, float acc_y_g, float acc_z_g) {
   // Store in world frame (Z = vertical, X/Y unused for now)
   s_accelWorld.x = 0.0f;
   s_accelWorld.y = 0.0f;
-  s_accelWorld.z = -accel_vertical_ms2;  // Negate so positive Z = up
+  s_accelWorld.z = accel_vertical_ms2;  // positive Z = up
   
   // Apply dead zone - zero out tiny accelerations (likely noise/bias)
   float accelWorld_mag = fabsf(accel_vertical_net_g);
@@ -139,7 +140,16 @@ uint32_t update(float acc_x_g, float acc_y_g, float acc_z_g) {
   s_accelHistoryIdx = (s_accelHistoryIdx + 1) % 10;
   
   float accel_var = variance(s_accelHistory, 10);
+  bool wasStationary = s_isStationary;
   s_isStationary = (accel_var < s_config.stationaryVarianceThreshold);
+  
+  // Track when we first became stationary
+  if (s_isStationary && !wasStationary) {
+    s_stationaryStartMs = now;
+  }
+  
+  // Calculate how long we've been stationary
+  float stationaryDuration = s_isStationary ? (now - s_stationaryStartMs) / 1000.0f : 0.0f;
   
   // Zero-velocity update (ZUPT): reset velocity when stationary
   if (s_config.enableZeroVelocityUpdate && s_isStationary) {
@@ -148,9 +158,11 @@ uint32_t update(float acc_x_g, float acc_y_g, float acc_z_g) {
     }
   }
   
-  // Position decay: pull position toward zero when stationary
+  // Position decay: pull position toward zero when stationary for long enough
   // This corrects for accumulated drift when device returns to rest
-  if (s_config.enablePositionDecay && s_isStationary) {
+  // Only start decaying after the delay period (don't decay during pauses at zenith!)
+  if (s_config.enablePositionDecay && s_isStationary && 
+      stationaryDuration > s_config.positionDecayDelay) {
     s_position.z *= s_config.positionDecayRate;
   }
   

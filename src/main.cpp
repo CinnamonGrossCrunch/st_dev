@@ -1,6 +1,6 @@
 // main.cpp - Feather Sense IMU Test (modular version)
 // Reads IMU + optional magnetometer and streams to Teleplot via Serial.
-// Accepts serial commands: "tare" to reset position origin.
+// Accepts serial/BLE commands: "tare", "cal <lbs>", "status", "help"
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -14,12 +14,12 @@
 #include "loadcell.h"
 
 // ---- Timing configuration ----
-static constexpr uint32_t kSampleIntervalMs = 20;   // ~50 Hz
+static constexpr uint32_t kSampleIntervalMs = 50;   // 20 Hz (was 50Hz - too fast for stable I2C)
 static constexpr uint32_t kHeartbeatIntervalMs = 1000;
 static constexpr uint32_t kStatusIntervalMs = 3000;
 static constexpr uint32_t kBleUpdateIntervalMs = 100;  // 10 Hz for BLE (conserve bandwidth)
 static constexpr uint32_t kBatteryIntervalMs = 5000;   // Battery check every 5 seconds (slow-changing)
-static constexpr uint32_t kLoadCellIntervalMs = 100;   // Load cell 10 Hz (HX711 is slow ~80Hz max)
+static constexpr uint32_t kLoadCellIntervalMs = 200;   // Load cell 5 Hz (was 10Hz - slower for stability)
 
 // ---- Timing state ----
 static uint32_t s_lastSampleMs = 0;
@@ -33,6 +33,88 @@ static uint32_t s_lastLoadCellMs = 0;
 static char s_cmdBuffer[32];
 static uint8_t s_cmdIndex = 0;
 
+// ---- BLE command buffer ----
+static char s_bleCmdBuffer[32];
+static uint8_t s_bleCmdIndex = 0;
+
+// Execute a parsed command (shared by Serial and BLE)
+void executeCommand(const char* cmd) {
+  // Parse command (case-insensitive)
+  if (strcasecmp(cmd, "tare") == 0) {
+    position::tare();
+    if (loadcell::tare()) {
+      teleplot::log("CMD: position & load cell tared");
+      ble::send("OK: tared\n");
+    } else {
+      teleplot::log("CMD: position tared, load cell tare failed");
+      ble::send("WARN: position tared, load cell tare failed\n");
+    }
+  } 
+  else if (strncasecmp(cmd, "cal ", 4) == 0) {
+    // Extract weight value (e.g., "cal 5" for 5 lbs)
+    float weight = atof(cmd + 4);
+    if (weight > 0.0f) {
+      if (loadcell::calibrate(weight)) {
+        float factor = loadcell::getCalibration();
+        int32_t offset = loadcell::getZeroOffset();
+        teleplot::log("CMD: calibration success");
+        teleplot::logKV("cal_factor", factor);
+        teleplot::logKV("zero_offset", offset);
+        ble::sendf("OK: calibrated at %.1f lbs\n", weight);
+      } else {
+        teleplot::log("CMD: calibration failed (check weight is applied)");
+        ble::send("ERROR: calibration failed\n");
+      }
+    } else {
+      teleplot::log("CMD: usage: cal <weight_lbs> (e.g., 'cal 5')");
+      ble::send("ERROR: usage: cal <weight_lbs>\n");
+    }
+  }
+  else if (strcasecmp(cmd, "help") == 0) {
+    teleplot::log("Commands: tare, cal <lbs>, help, status");
+    ble::send("Commands: tare, cal <lbs>, help, status\n");
+  }
+  else if (strcasecmp(cmd, "status") == 0) {
+    teleplot::log("=== Status ===");
+    ble::send("=== Status ===\n");
+    
+    // Load cell status
+    int32_t raw;
+    if (loadcell::readRaw(raw)) {
+      teleplot::logKV("loadcell_raw", raw);
+      ble::sendf("loadcell_raw: %ld\n", raw);
+    }
+    teleplot::logKV("zero_offset", loadcell::getZeroOffset());
+    teleplot::logKV("cal_factor", loadcell::getCalibration());
+    ble::sendf("zero_offset: %ld\n", loadcell::getZeroOffset());
+    ble::sendf("cal_factor: %.2f\n", loadcell::getCalibration());
+    ble::sendf("backend: %s\n", loadcell::getBackendName());
+    
+    float weight;
+    if (loadcell::read(weight)) {
+      teleplot::logKV("weight_lbs", weight);
+      ble::sendf("weight_lbs: %.2f\n", weight);
+    } else {
+      teleplot::log("weight_lbs: [read failed]");
+      ble::send("weight_lbs: [read failed]\n");
+    }
+    
+    // IMU and system status
+    teleplot::logKV("imu_ok", imu::imuOk() ? 1 : 0);
+    teleplot::logKV("mag_present", imu::magOk() ? 1 : 0);
+    teleplot::logKV("ble_connected", ble::isConnected() ? 1 : 0);
+    teleplot::logKV("ble_advertising", ble::isAdvertising() ? 1 : 0);
+    ble::sendf("imu_ok: %d\n", imu::imuOk() ? 1 : 0);
+    ble::sendf("mag_present: %d\n", imu::magOk() ? 1 : 0);
+    teleplot::logKV("power_source", battery::isUsbPowered() ? "USB" : "BATTERY");
+    teleplot::logKV("battery_status", battery::getStatusString());
+  }
+  else if (strlen(cmd) > 0) {
+    teleplot::log("CMD: unknown (try 'help')");
+    ble::send("ERROR: unknown command (try 'help')\n");
+  }
+}
+
 // Process incoming serial commands (non-blocking)
 void processSerialCommands() {
   while (Serial.available()) {
@@ -42,66 +124,35 @@ void processSerialCommands() {
     if (c == '\n' || c == '\r') {
       if (s_cmdIndex > 0) {
         s_cmdBuffer[s_cmdIndex] = '\0';  // Null-terminate
-        
-        // Parse command (case-insensitive)
-        if (strcasecmp(s_cmdBuffer, "tare") == 0) {
-          position::tare();
-          if (loadcell::tare()) {
-            teleplot::log("CMD: position & load cell tared");
-          } else {
-            teleplot::log("CMD: position tared, load cell tare failed");
-          }
-        } 
-        else if (strncasecmp(s_cmdBuffer, "cal ", 4) == 0) {
-          // Extract weight value (e.g., "cal 5" for 5 lbs)
-          float weight = atof(s_cmdBuffer + 4);
-          if (weight > 0.0f) {
-            if (loadcell::calibrate(weight)) {
-              float factor = loadcell::getCalibration();
-              int32_t offset = loadcell::getZeroOffset();
-              teleplot::log("CMD: calibration success");
-              teleplot::logKV("cal_factor", factor);
-              teleplot::logKV("zero_offset", offset);
-            } else {
-              teleplot::log("CMD: calibration failed (check weight is applied)");
-            }
-          } else {
-            teleplot::log("CMD: usage: cal <weight_lbs> (e.g., 'cal 5')");
-          }
-        }
-        else if (strcasecmp(s_cmdBuffer, "help") == 0) {
-          teleplot::log("Commands: tare, cal <lbs>, help, status");
-        }
-        else if (strcasecmp(s_cmdBuffer, "status") == 0) {
-          teleplot::log("=== Load Cell Status ===");
-          int32_t raw;
-          if (loadcell::readRaw(raw)) {
-            teleplot::logKV("loadcell_raw", raw);
-          }
-          teleplot::logKV("zero_offset", loadcell::getZeroOffset());
-          teleplot::logKV("cal_factor", loadcell::getCalibration());
-          float weight;
-          if (loadcell::read(weight)) {
-            teleplot::logKV("weight_lbs", weight);
-          } else {
-            teleplot::log("weight_lbs: [read failed]");
-          }
-          teleplot::logKV("imu_ok", imu::imuOk() ? 1 : 0);
-          teleplot::logKV("mag_present", imu::magOk() ? 1 : 0);
-          teleplot::logKV("ble_connected", ble::isConnected() ? 1 : 0);
-          teleplot::logKV("power_source", battery::isUsbPowered() ? "USB" : "BATTERY");
-          teleplot::logKV("battery_status", battery::getStatusString());
-        }
-        else if (s_cmdIndex > 0) {
-          teleplot::log("CMD: unknown (try 'help')");
-        }
-        
+        executeCommand(s_cmdBuffer);
         s_cmdIndex = 0;  // Reset buffer
       }
     } 
     else if (s_cmdIndex < sizeof(s_cmdBuffer) - 1) {
       // Add character to buffer (if room)
       s_cmdBuffer[s_cmdIndex++] = c;
+    }
+  }
+}
+
+// Process incoming BLE commands (non-blocking)
+void processBleCommands() {
+  while (ble::available()) {
+    char c = ble::read();
+    
+    // Handle end of command (newline or carriage return)
+    if (c == '\n' || c == '\r') {
+      if (s_bleCmdIndex > 0) {
+        s_bleCmdBuffer[s_bleCmdIndex] = '\0';  // Null-terminate
+        teleplot::log("BLE_CMD: ");
+        teleplot::log(s_bleCmdBuffer);
+        executeCommand(s_bleCmdBuffer);
+        s_bleCmdIndex = 0;  // Reset buffer
+      }
+    } 
+    else if (s_bleCmdIndex < sizeof(s_bleCmdBuffer) - 1) {
+      // Add character to buffer (if room)
+      s_bleCmdBuffer[s_bleCmdIndex++] = c;
     }
   }
 }
@@ -116,7 +167,7 @@ void setup() {
   Wire.begin();
   teleplot::begin();
 
-  teleplot::log("boot: imu_test");
+  teleplot::log("boot: StrongTrak");
 
   if (!imu::begin()) {
     teleplot::log("ERROR: IMU init failed");
@@ -146,17 +197,13 @@ void setup() {
 
   // Initialize load cell
   loadcell::Config lcCfg;
-  lcCfg.sckPin = 11;
-  lcCfg.dtPin = 12;
+  lcCfg.sckPin = 11;  // Only used for HX711 backend
+  lcCfg.dtPin = 12;   // Only used for HX711 backend
   
-  // Debug: Check DT pin state before init
-  pinMode(12, INPUT);
-  int dtState = digitalRead(12);
-  teleplot::logKV("HX711_DT_pin_state", dtState);
-  teleplot::log(dtState == HIGH ? "DT is HIGH (not ready or no power)" : "DT is LOW (ready)");
+  teleplot::logKV("loadcell_backend", loadcell::getBackendName());
   
   if (!loadcell::begin(lcCfg)) {
-    teleplot::log("WARN: Load cell init failed - timeout waiting for HX711");
+    teleplot::log("WARN: Load cell init failed");
   } else {
     teleplot::log("Load cell ready");
     delay(500);
@@ -176,6 +223,9 @@ void loop() {
 
   // Process any incoming serial commands (non-blocking)
   processSerialCommands();
+  
+  // Process any incoming BLE commands (non-blocking)
+  processBleCommands();
 
   // LED heartbeat at 2 Hz.
   digitalWrite(LED_BUILTIN, (nowMs / 250) % 2);
@@ -184,6 +234,14 @@ void loop() {
   if ((nowMs - s_lastHeartbeatMs) >= kHeartbeatIntervalMs) {
     s_lastHeartbeatMs = nowMs;
     teleplot::logKV("heartbeat_ms", (int)nowMs);
+    
+    // Log BLE status periodically (helps debug if serial opened after boot)
+    static uint8_t bleStatusCount = 0;
+    if (bleStatusCount < 5) {  // Only first 5 heartbeats
+      teleplot::logKV("ble_connected", ble::isConnected() ? 1 : 0);
+      teleplot::logKV("ble_advertising", ble::isAdvertising() ? 1 : 0);
+      bleStatusCount++;
+    }
   }
 
   // Periodic status (useful if serial opened after boot).
@@ -219,54 +277,26 @@ void loop() {
     }
   }
 
-  // Load cell reading
+  // Load cell reading (at configured rate - with I2C timing)
+  static float s_weightLbs = 0.0f;
   if ((nowMs - s_lastLoadCellMs) >= kLoadCellIntervalMs) {
     s_lastLoadCellMs = nowMs;
-
-    // Track last time the HX711 was ready to avoid noisy warnings
-    static uint32_t lastReadyMs = 0;
-    static uint32_t lastWarnMs = 0;
-    if (lastReadyMs == 0) lastReadyMs = nowMs;  // initialize
-
-    if (loadcell::isReady()) {
-      lastReadyMs = nowMs;
-
-      int32_t raw;
-      if (loadcell::readRaw(raw)) {
-        // Always emit raw value for diagnostics (even if filtered out later)
-        teleplot::emit("loadcell_raw", (float)raw);
-        
-        // Log zero offset and calibration factor for debugging
-        static uint32_t lastDiagMs = 0;
-        if ((nowMs - lastDiagMs) > 2000) {  // Every 2 seconds
-          lastDiagMs = nowMs;
-          teleplot::logKV("zero_offset", loadcell::getZeroOffset());
-          teleplot::logKV("cal_factor", loadcell::getCalibration());
-        }
-
-        float weight_lbs;
-        if (loadcell::read(weight_lbs)) {
-          teleplot::emit("weight_lbs", weight_lbs);
-        }
-      }
-      // Removed error logging - bad reads are now silently filtered
-
-    } else {
-      // Only warn if we've been not-ready for >5s AND haven't recently warned
-      if ((nowMs - lastReadyMs) > 5000 && (nowMs - lastWarnMs) > 5000) {
-        teleplot::log("WARN: HX711 not ready (check wiring)");
-        lastWarnMs = nowMs;
-      }
+    float weight;
+    if (loadcell::read(weight)) {
+      s_weightLbs = weight;
+      teleplot::emit("weight_lbs", weight);
     }
+    delay(5); // Small delay to let I2C bus settle after load cell read
   }
 
   // If IMU not available, only heartbeat/status.
   if (!imu::imuOk()) return;
 
-  // Sample at configured rate.
+  // Sample at configured rate (with I2C timing).
   if ((nowMs - s_lastSampleMs) < kSampleIntervalMs) return;
   s_lastSampleMs = nowMs;
 
+  delay(2); // Small delay before IMU read to avoid I2C conflicts
   imu::Reading r;
   if (!imu::read(r)) return;
 
@@ -279,9 +309,13 @@ void loop() {
   teleplot::emit("height_cm", pos.z * 100.0f);
   teleplot::emit("vel_z_ms", vel.z);
   
-  // Emit raw IMU data (can be disabled for cleaner output)
-  // teleplot::emitVec3("acc_g", r.acc_x, r.acc_y, r.acc_z);
-  // teleplot::emitVec3("gyro_dps", r.gyro_x, r.gyro_y, r.gyro_z);
+  // Emit raw IMU data for analysis
+  teleplot::emit("accel_x_g", r.acc_x);
+  teleplot::emit("accel_y_g", r.acc_y);
+  teleplot::emit("accel_z_g", r.acc_z);
+  teleplot::emit("gyro_x_dps", r.gyro_x);
+  teleplot::emit("gyro_y_dps", r.gyro_y);
+  teleplot::emit("gyro_z_dps", r.gyro_z);
   teleplot::emit("imu_temp_C", r.temp);
   
   // Magnetometer (optional)
@@ -292,7 +326,9 @@ void loop() {
   // Send data over BLE at lower rate (to conserve bandwidth)
   if (ble::isConnected() && (nowMs - s_lastBleUpdateMs) >= kBleUpdateIntervalMs) {
     s_lastBleUpdateMs = nowMs;
-    // CSV format for Bluefruit Connect plotter: "height_cm,velocity_m/s\n"
-    ble::sendf("%.1f,%.2f\n", pos.z * 100.0f, vel.z);
+    
+    // CSV format: "height_cm,velocity_m/s,weight_lbs\n"
+    // Parsed by Bluetooth_Dashboard web app (src/lib/parser.ts)
+    ble::sendf("%.1f,%.2f,%.2f\n", pos.z * 100.0f, vel.z, s_weightLbs);
   }
 }

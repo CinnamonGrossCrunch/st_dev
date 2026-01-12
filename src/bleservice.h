@@ -20,6 +20,9 @@ bool init(const Config& cfg = Config{});
 // Returns true if a central is connected
 bool isConnected();
 
+// Returns true if BLE is initialized and advertising
+bool isAdvertising();
+
 // Send a string over BLE UART (Nordic UART Service)
 // Safe to call even if not connected (will be ignored)
 void send(const char* str);
@@ -27,6 +30,12 @@ void send(const String& str);
 
 // Printf-style send (max 128 chars)
 void sendf(const char* fmt, ...);
+
+// Check for incoming data from BLE UART RX
+int available();
+
+// Read one byte from BLE UART RX
+char read();
 
 // Call periodically in loop() if you want to handle BLE events
 // (optional - Bluefruit handles most things via callbacks)

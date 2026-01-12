@@ -130,7 +130,7 @@ bool read(Reading &out) {
   // Convert to user-friendly units.
   out.acc_x = accel.acceleration.x / 9.80665f;
   out.acc_y = accel.acceleration.y / 9.80665f;
-  out.acc_z = accel.acceleration.z / 9.80665f;
+  out.acc_z = -accel.acceleration.z / 9.80665f;  // Inverted Z for correct gravity sign
 
   out.gyro_x = gyro.gyro.x * 57.2958f;
   out.gyro_y = gyro.gyro.y * 57.2958f;

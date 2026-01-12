@@ -34,3 +34,32 @@ The project is transitioning from Phase 0 (IMU testbed) to Phase 1 (HX711 load c
 
 The developer is a capable product/industrial designer but a **novice embedded programmer**.
 Provide rationale for decisions and explain acronyms on first use.
+
+## Cross-Project Architecture: Firmware ↔ Web Dashboard
+
+This firmware project is the **source of truth** for BLE data format. A companion web app
+consumes the BLE stream:
+
+| Component | Location | Role |
+|-----------|----------|------|
+| **Firmware (C++)** | `strongtrak_test/` | Runs on Feather nRF52840 Sense. Streams sensor data via BLE NUS (Nordic UART Service). |
+| **Web Dashboard (TypeScript/Next.js)** | `Bluetooth_Dashboard/` | Receives BLE stream and displays real-time weight, position, velocity. |
+
+### BLE Data Contract
+
+The firmware sends CSV lines over BLE NUS TX characteristic:
+
+```
+height_cm,velocity_m/s,weight_lbs\n
+```
+
+Example: `12.5,0.34,45.67\n`
+
+**Parser location:** `Bluetooth_Dashboard/src/lib/parser.ts`
+
+### Sync Rules
+
+1. **Firmware is source of truth** - If you change the BLE data format in `main.cpp`, you MUST update `parser.ts` to match.
+2. **Service UUID** - Both use Nordic UART Service: `6e400001-b5a3-f393-e0a9-e50e24dcca9e`
+3. **Device name** - Firmware advertises as `"StrongTrak"` (set in `ble::init()`)
+4. **Test locally** - Run dashboard on `localhost:3000` (Web Bluetooth works on localhost)

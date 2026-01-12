@@ -10,6 +10,7 @@ static BLEUart bleuart;
 
 // Connection state
 static volatile bool connected = false;
+static bool s_initSuccess = false;
 
 // Callbacks
 static void connectCallback(uint16_t connHandle) {
@@ -26,14 +27,19 @@ static void disconnectCallback(uint16_t connHandle, uint8_t reason) {
 }
 
 bool init(const Config& cfg) {
+  Serial.println("ble:init starting...");
+  
   // Initialize Bluefruit
   if (!Bluefruit.begin()) {
-    Serial.println("ble:init_failed");
+    Serial.println("ble:init_failed - Bluefruit.begin() returned false");
     return false;
   }
+  Serial.println("ble:Bluefruit.begin() OK");
 
   Bluefruit.setTxPower(cfg.txPower);
   Bluefruit.setName(cfg.deviceName);
+  Serial.print("ble:name set to ");
+  Serial.println(cfg.deviceName);
 
   // Set connection callbacks
   Bluefruit.Periph.setConnectCallback(connectCallback);
@@ -41,26 +47,39 @@ bool init(const Config& cfg) {
 
   // Add UART service
   bleuart.begin();
+  Serial.println("ble:UART service started");
 
-  // Set up advertising
+  // Set up advertising - keep it minimal to avoid packet overflow
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
-  Bluefruit.Advertising.addTxPower();
   Bluefruit.Advertising.addService(bleuart);
+  
+  // Put name in scan response (more room there)
   Bluefruit.ScanResponse.addName();
 
   // Advertising parameters
   Bluefruit.Advertising.restartOnDisconnect(true);
-  Bluefruit.Advertising.setInterval(32, 244);  // in units of 0.625 ms
+  Bluefruit.Advertising.setInterval(32, 244);  // Standard intervals (in 0.625ms units)
   Bluefruit.Advertising.setFastTimeout(30);    // seconds in fast mode
-  Bluefruit.Advertising.start(0);              // 0 = advertise forever
+  
+  // Start advertising
+  if (!Bluefruit.Advertising.start(0)) {        // 0 = advertise forever
+    Serial.println("ble:Advertising.start() FAILED");
+    return false;
+  }
 
-  Serial.print("ble:advertising:");
-  Serial.println(cfg.deviceName);
+  Serial.print("ble:advertising started as '");
+  Serial.print(cfg.deviceName);
+  Serial.println("'");
+  s_initSuccess = true;
   return true;
 }
 
 bool isConnected() {
   return connected;
+}
+
+bool isAdvertising() {
+  return s_initSuccess && !connected;
 }
 
 void send(const char* str) {
@@ -83,9 +102,17 @@ void sendf(const char* fmt, ...) {
   bleuart.write(buf);
 }
 
+int available() {
+  return bleuart.available();
+}
+
+char read() {
+  return bleuart.read();
+}
+
 void update() {
   // Bluefruit uses SoftDevice callbacks; nothing required here for basic UART.
-  // Could poll bleuart.available() for incoming commands if needed.
+  // Use available() and read() to process incoming commands.
 }
 
 }  // namespace ble
