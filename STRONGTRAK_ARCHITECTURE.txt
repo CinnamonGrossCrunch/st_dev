@@ -1,11 +1,21 @@
 ================================================================================
                     STRONGTRAK - SYSTEM ARCHITECTURE & ROADMAP
-                              December 20, 2025
+                         Last Updated: January 14, 2026
 ================================================================================
 
 This document captures the long-term vision, architecture, and phased roadmap
 for StrongTrak: a retrofit sensor system for gym cable machines that turns
 every rep into actionable data.
+
+HOW TO USE THIS DOCUMENT
+------------------------
+- NEW READERS: Start with Section 1 (Executive Summary), then Section 3 
+  (System Architecture), then Section 10 (Phased Roadmap) for context.
+- FIRMWARE DEVELOPERS: Focus on Section 5 (Module Architecture), Section 6 
+  (BLE Strategy), and Section 10.1 (Phase 2 Focus) for current work.
+- APP DEVELOPERS: See Section 6.1 (BLE Data Contract) for parsing specs and
+  Section 7 (Phone App Responsibilities) for integration.
+- DEBUGGING/PRACTICES: Sections 15-18 are reference material for development.
 
 ================================================================================
 TABLE OF CONTENTS
@@ -16,10 +26,12 @@ TABLE OF CONTENTS
 4.  HARDWARE BLOCK DIAGRAM
 5.  FIRMWARE MODULE ARCHITECTURE
 6.  BLE SERVICES & CHARACTERISTICS STRATEGY
+    6.1 BLE DATA CONTRACT (CURRENT)
 7.  PHONE APP RESPONSIBILITIES
 8.  BACKEND RESPONSIBILITIES
 9.  QR CLAIM FLOW & BLE DISCOVERY
 10. PHASED ROADMAP WITH MILESTONES
+    10.1 PHASE 2 FOCUS SUMMARY
 11. POWER STATE MACHINE
 12. ADVERTISING STRATEGY & POWER TRADEOFFS
 13. MINIMUM VIABLE DATA (MVP PROTOTYPE)
@@ -28,6 +40,10 @@ TABLE OF CONTENTS
 16. ASSUMPTIONS & CONSTRAINTS
 17. HANDOFF NOTES FOR FUTURE ENGINEERS
 18. AGENTIC CODING GUIDELINES (FOR AI ASSISTANTS)
+19. REP DETECTION DESIGN SPECIFICATION
+20. SENSOR SYNCHRONIZATION & TIMING
+21. DEFERRED FEATURES & OUT-OF-SCOPE ITEMS
+22. CHANGELOG & VERSION HISTORY
 
 ================================================================================
 1. EXECUTIVE SUMMARY & PRODUCT VISION
@@ -448,6 +464,93 @@ BUT: Custom services require custom app code. NUS works with off-the-shelf
 apps. Start simple, migrate when you have app development resources.
 
 
+------------------------------------------------------------------------------
+6.1 BLE DATA CONTRACT (CURRENT IMPLEMENTATION)
+------------------------------------------------------------------------------
+
+This section defines the AUTHORITATIVE data format exchanged between firmware
+and client applications. Both sides MUST implement this contract exactly.
+
+CURRENT FORMAT: ASCII CSV over Nordic UART Service (NUS)
+--------------------------------------------------------
+
+Service UUID: 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
+TX Characteristic: 6E400003-B5A3-F393-E0A9-E50E24DCCA9E (notify)
+RX Characteristic: 6E400002-B5A3-F393-E0A9-E50E24DCCA9E (write)
+
+STREAMING DATA FORMAT (TX):
+  "height_cm,velocity_m_s,weight_lbs\n"
+
+  Field 1: height_cm     - Vertical position in cm from tare point (float, 1 decimal)
+  Field 2: velocity_m_s  - Vertical velocity in m/s (float, 2 decimals)
+  Field 3: weight_lbs    - Load cell reading in pounds (float, 2 decimals)
+
+  Example: "12.5,0.34,45.67\n"
+  
+  Transmission rate: 10 Hz (100ms intervals)
+  Encoding: ASCII UTF-8, newline-terminated
+  Parser: Bluetooth_Dashboard/src/lib/parser.ts
+
+COMMAND FORMAT (RX):
+  Commands are ASCII strings, newline-terminated:
+  
+  | Command        | Description                              | Response          |
+  |----------------|------------------------------------------|-------------------|
+  | tare           | Zero position and load cell              | OK: tared         |
+  | cal <lbs>      | Calibrate with known weight in lbs       | OK: calibrated... |
+  | status         | Get device status                        | Multi-line status |
+  | help           | List available commands                  | Commands: ...     |
+
+  Example: "cal 5\n" → Calibrate with 5 lb weight
+
+STATUS RESPONSE FORMAT:
+  Multi-line ASCII with key-value pairs:
+  === Status ===
+  loadcell_raw: <int32>
+  zero_offset: <int32>
+  cal_factor: <float>
+  backend: NAU7802
+  weight_lbs: <float>
+  imu_ok: 1
+  mag_present: 1
+
+DATA LOSS DETECTION:
+  - Currently: Timestamp comparison on client side (parser.ts uses Date.now())
+  - Gaps >150ms between packets may indicate loss
+  - Future: Add sequence number to binary format when migrating
+
+ENDIANNESS & ENCODING NOTES (for future binary format):
+  - All multi-byte integers: Little-endian (native ARM Cortex-M4)
+  - Float32: IEEE 754, little-endian
+  - Signed integers: Two's complement
+  - Strings: UTF-8, null-terminated or length-prefixed
+
+FUTURE BINARY FORMAT (Phase 3+):
+  When migrating to custom GATT service, use this binary structure:
+  
+  | Offset | Size | Type    | Field        | Units/Scale            |
+  |--------|------|---------|--------------|------------------------|
+  | 0      | 4    | uint32  | timestamp_ms | ms since boot          |
+  | 4      | 2    | int16   | height_mm    | 0.1mm per LSB          |
+  | 6      | 2    | int16   | velocity     | 0.01 m/s per LSB       |
+  | 8      | 2    | int16   | weight       | 0.01 lbs per LSB       |
+  | 10     | 2    | int16   | accel_x      | 0.001 g per LSB        |
+  | 12     | 2    | int16   | accel_y      | 0.001 g per LSB        |
+  | 14     | 2    | int16   | accel_z      | 0.001 g per LSB        |
+  | 16     | 2    | int16   | gyro_x       | 0.1 deg/s per LSB      |
+  | 18     | 2    | int16   | gyro_y       | 0.1 deg/s per LSB      |
+  | 20     | 2    | int16   | gyro_z       | 0.1 deg/s per LSB      |
+  | 22     | 1    | uint8   | sequence     | Packet sequence 0-255  |
+  | 23     | 1    | uint8   | flags        | Status/error bits      |
+  |--------|------|---------|--------------|------------------------|
+  | Total  | 24 bytes                                               |
+  
+  Scale factor rationale:
+  - int16 weight at 0.01 lbs/LSB: Range ±327 lbs, resolution 0.01 lbs
+  - int16 height at 0.1mm/LSB: Range ±3.2m, resolution 0.1mm  
+  - int16 velocity at 0.01 m/s/LSB: Range ±3.27 m/s, resolution 1 cm/s
+
+
 ================================================================================
 7. PHONE APP RESPONSIBILITIES
 ================================================================================
@@ -578,7 +681,7 @@ This allows the app to:
 PHASE 0: IMU TESTBED STABILITY (CURRENT - 1-2 weeks)
 ------------------------------------------------------------------------------
 
-GOAL: Stabilize current codebase, establish good practices, prepare for HX711.
+GOAL: Stabilize current codebase, establish good practices, prepare for NAU7802.
 
 TASKS:
 [x] IMU streaming with auto-detection (DONE)
@@ -692,28 +795,68 @@ PROOF TEST:
 - Verify rep timing matches actual movement phases
 - Test motion wake from device sleep state
 
-TASKS:
-[ ] Define binary packet format (header, timestamp, force, accel, gyro)
-[ ] Implement packet packing in ble_streaming.cpp
-[ ] Handle MTU negotiation for larger packets
-[ ] Implement connection event callbacks (connect, disconnect, param update)
-[ ] Add reconnection handling on device side
-[ ] Test streaming under load (fast movement, many reps)
-[ ] Measure actual throughput and latency
+IN SCOPE FOR PHASE 2:
+- Force-based rep detection (primary trigger)
+- Basic concentric/eccentric phase detection
+- Rep count, duration, and peak force metrics
+- Motion interrupt configuration for wake-up
+- Streaming data format refinement
 
-SUCCESS CRITERIA:
-- <50ms latency from sensor read to phone receipt
-- No data loss during normal workout
-- Graceful handling of disconnect/reconnect
+OUT OF SCOPE FOR PHASE 2 (deferred to Phase 3+):
+- Binary BLE packet format (staying with ASCII CSV for now)
+- Full power optimization and sleep states
+- Exercise classification (all exercises treated same initially)
+- On-device rep storage (flash writes)
 
-KEY RISKS:
-- THROUGHPUT LIMITS: BLE can do ~1-2 KB/s realistically with connection
-  intervals and MTU limits. Raw streaming at 50 Hz may overflow.
-  Mitigation: Calculate exact bandwidth needs. At 50 Hz, 20 bytes/sample =
-  1000 bytes/sec. Should be OK with 247-byte MTU and proper intervals.
+See Section 10.1 below for Phase 2 developer quick reference.
 
-- CONNECTION PARAMETER NEGOTIATION: iOS is strict about connection intervals.
-  Mitigation: Use Apple-recommended intervals (15-30ms for streaming).
+------------------------------------------------------------------------------
+10.1 PHASE 2 FOCUS SUMMARY (DEVELOPER QUICK REFERENCE)
+------------------------------------------------------------------------------
+
+This section consolidates all Phase 2 relevant information for active development.
+
+CURRENT SAMPLING RATES (main.cpp):
+  - IMU:       20 Hz (50ms intervals) - kSampleIntervalMs
+  - Load Cell:  5 Hz (200ms intervals) - kLoadCellIntervalMs  
+  - BLE TX:    10 Hz (100ms intervals) - kBleUpdateIntervalMs
+
+I2C BUS MANAGEMENT:
+  - NAU7802 read: 5ms settling delay after
+  - IMU read: 2ms settling delay before
+  - Both devices on same I2C bus, careful timing required
+
+KEY FILES TO MODIFY:
+  - src/main.cpp              - Main loop, sensor reading, BLE streaming
+  - src/loadcell.cpp          - Load cell reading and calibration
+  - src/imu.cpp               - IMU reading and filtering
+  - src/position.cpp          - Position/velocity integration
+  - NEW: src/rep_detector.cpp - Rep detection algorithm (to create)
+
+BLE DATA CONTRACT (Section 6.1):
+  Format: "height_cm,velocity_m/s,weight_lbs\n"
+  Rate: 10 Hz
+  Parser: Bluetooth_Dashboard/src/lib/parser.ts
+
+REP DETECTION ALGORITHM (Section 19):
+  See full specification in Section 19 for:
+  - Threshold values and tuning guidance
+  - State machine implementation
+  - Metric definitions (tempo, duration, peak force)
+
+SENSOR SYNCHRONIZATION (Section 20):
+  See Section 20 for timing diagram and synchronization approach.
+
+TESTING CHECKLIST:
+  [ ] Tare and calibration work correctly
+  [ ] Weight readings stable ±0.1 lbs
+  [ ] BLE streaming reliable for 10+ minutes
+  [ ] Position tracking resets properly after tare
+  [ ] I2C bus stable with both sensors
+
+NEXT STEPS AFTER PHASE 2:
+  - Phase 3: Power optimization, sleep modes, motion wake
+  - Phase 4: Binary BLE format, on-device rep storage
 
 PROOF TEST:
 - Stream at target rate for 5 minutes, count packets, verify none lost
@@ -741,7 +884,7 @@ TASKS:
 [ ] Configure nRF52840 sleep modes (System ON sleep with RAM retention)
 [ ] Set up IMU motion interrupt as wake source
 [ ] Implement adaptive advertising (slow idle, fast on motion)
-[ ] Power down HX711 between samples
+[ ] Power down NAU7802 between samples
 [ ] Measure current draw in each state (need current meter or Power Profiler)
 [ ] Calculate expected battery life
 [ ] Test wake latency (motion to discoverable)
@@ -985,7 +1128,7 @@ IDLE_ADV_SLOW (Target: <15µA average)
   - TX power: -8 dBm (low, saves power)
   - MCU in System ON sleep between advertisements
   - IMU in low-power mode with motion interrupt enabled
-  - HX711 powered down
+  - NAU7802 powered down (AVDDS=0 via I2C register)
   - Wake sources: BLE connection, IMU motion interrupt
 
 BOOST_ADV_FAST (Target: <200µA average)
@@ -1000,13 +1143,13 @@ CONNECTED (Target: <100µA average)
   - Advertising stopped
   - Waiting for commands from Central
   - IMU in low-power mode (or off)
-  - HX711 powered down
+  - NAU7802 powered down
   - MCU mostly sleeping, wakes on BLE events
 
 STREAMING (Target: <5mA average)
   - Active data collection and transmission
-  - IMU sampling at 50 Hz
-  - HX711 sampling at 10-80 Hz
+  - IMU sampling at 20 Hz (current config, adjustable)
+  - NAU7802 sampling at 5 Hz (force curve capture)
   - BLE notifications at configured rate
   - MCU mostly active
 
@@ -1161,11 +1304,13 @@ MVP SUCCESS METRICS
 14. TOP TECHNICAL RISKS & MITIGATIONS
 ================================================================================
 
-RISK 1: HX711 ELECTRICAL NOISE
-------------------------------
-Severity: HIGH
-Description: The HX711 amplifies tiny signals (microvolts). Electrical noise
-  from gym equipment, LED lights, or the MCU itself can corrupt readings.
+RISK 1: LOAD CELL ELECTRICAL NOISE
+----------------------------------
+Severity: MEDIUM (reduced from HIGH due to NAU7802's superior noise rejection)
+Description: The NAU7802 amplifies tiny signals (microvolts) from the load cell.
+  Electrical noise from gym equipment, LED lights, or the MCU can affect readings.
+  Note: NAU7802 has much better noise performance than HX711 due to its 24-bit
+  ADC and built-in digital filtering.
 
 Symptoms:
   - Noisy force readings
@@ -1174,11 +1319,10 @@ Symptoms:
 
 Mitigations:
   - Use shielded cable for load cell connection
-  - Keep HX711 wires short (<10cm if possible)
-  - Add 0.1µF capacitors at HX711 power pins
-  - Software filtering (EMA or median filter)
-  - Sample multiple times and average
-  - Shield the entire assembly if needed
+  - Keep NAU7802 wires short (<10cm if possible)
+  - NAU7802 has internal filtering; configure sample rate appropriately
+  - Software filtering (EMA or median filter) for additional smoothing
+  - Sample multiple times and average if needed
 
 Test: Read force with no load for 1 minute. Noise should be <0.1 kg peak-to-peak.
 
@@ -1486,7 +1630,7 @@ TESTABILITY
    
    // Hard to test
    void processForce() {
-     float f = hx711.read();  // Hardcoded to real hardware
+     float f = loadcell::read();  // Hardcoded to real hardware
      ...
    }
    
@@ -1533,7 +1677,7 @@ SOFT CONSTRAINTS (PREFERENCES)
    (Rationale: Library support, faster development, handoff-friendly)
 
 3. Prefer proven libraries over custom implementations
-   (Unless library is problematic - see HX711 discussion)
+   (e.g., using SparkFun NAU7802 library for load cell)
 
 
 ================================================================================
@@ -1551,12 +1695,15 @@ WHAT'S WORKING (as of December 2025):
 - Modular code structure
 
 WHAT'S NOT YET IMPLEMENTED:
-- HX711 load cell integration
-- Custom GATT service
-- Power optimization
-- Rep detection
-- Flash storage
+- Custom GATT service (currently using NUS)
+- Power optimization (idle/sleep states)
+- Rep detection (Phase 2 in progress)
+- Flash storage for calibration
 - DFU/FUOTA
+
+WHAT'S WORKING (added Phase 1):
+- NAU7802 load cell integration (5.00 lbs calibration verified)
+- Modular backend abstraction (loadcell.cpp + loadcell_backend_nau7802.cpp)
 
 KNOWN QUIRKS:
 - Must double-tap RESET for reliable upload (bootloader entry)
@@ -1566,7 +1713,7 @@ KNOWN QUIRKS:
 WHERE TO START:
 1. Read PROJECT_SUMMARY.txt for completed work and lessons learned
 2. Read this document for architecture and roadmap
-3. Start with Phase 1 (HX711 integration)
+3. Continue with Phase 2 (IMU improvements + Rep Detection)
 
 CODE STYLE NOTES:
 - Namespaces for modules (imu::, teleplot::, etc.)
@@ -1609,8 +1756,8 @@ embedded programmer. They need:
 
 CURRENT PHASE:
 Check the PHASED ROADMAP section to understand what's already done and what's
-next. As of initial writing (December 2025), the project is in Phase 0/1
-transition (IMU working, HX711 integration next).
+next. As of January 2026, Phase 1 (NAU7802 load cell) is COMPLETE and 
+Phase 2 (IMU improvements + Rep Detection) is IN PROGRESS.
 
 ------------------------------------------------------------------------------
 CRITICAL RULES FOR AI AGENTS
@@ -1772,13 +1919,13 @@ DEBUGGING A HANG/CRASH:
 PHASE-SPECIFIC GUIDANCE
 ------------------------------------------------------------------------------
 
-PHASE 1 (HX711 LOAD CELL):
-- Create src/sensors/loadcell.h and loadcell.cpp
-- HX711 uses bit-banging (toggle GPIO manually), not I2C
-- Pins needed: DOUT (data in), SCK (clock out), VCC, GND
-- Power-down HX711 by holding SCK high for >60µs
-- Implement tare (zero offset) and calibration (scale factor)
-- Store calibration to flash using Preferences library
+PHASE 1 (NAU7802 LOAD CELL) - COMPLETED ✅:
+- Created src/loadcell.h, loadcell.cpp, loadcell_backend.h, loadcell_backend_nau7802.cpp
+- NAU7802 uses I2C interface at address 0x2A (simpler than HX711 bit-banging)
+- Configured: Gain 128x, 80 SPS, LDO 3.3V, internal PGA
+- Power-down NAU7802 via AVDDS bit in PU_CTRL register
+- Tare and calibration implemented (5.00 lbs calibration weight used)
+- Calibration stored in code (flash persistence deferred to Phase 4)
 
 PHASE 2 (BLE PACKETS):
 - Define binary struct for sensor data
@@ -1859,6 +2006,356 @@ AT END OF SESSION:
 [ ] Update PROJECT_SUMMARY.txt if significant changes
 [ ] Leave code in buildable state
 [ ] Note any TODO items for next session
+
+
+================================================================================
+19. REP DETECTION DESIGN SPECIFICATION
+================================================================================
+
+This section provides detailed design guidance for implementing rep detection.
+
+------------------------------------------------------------------------------
+19.1 ALGORITHM OVERVIEW
+------------------------------------------------------------------------------
+
+The rep detection algorithm uses FORCE as the primary trigger, with optional
+IMU data for phase detection and validation.
+
+RATIONALE FOR FORCE-BASED DETECTION:
+- Force directly correlates to weight movement (cable under tension = work)
+- IMU can be noisy during exercise (vibration, user movement)
+- Force thresholds are more stable and predictable than acceleration
+- IMU data enhances phase detection but is not required for basic counting
+
+STATE MACHINE:
+  ┌─────────────┐      force > START_THRESHOLD      ┌─────────────┐
+  │    IDLE     │ ────────────────────────────────► │   IN_REP    │
+  │             │ ◄──────────────────────────────── │             │
+  └─────────────┘      force < END_THRESHOLD        └─────────────┘
+                       AND duration > MIN_DURATION
+
+------------------------------------------------------------------------------
+19.2 THRESHOLD VALUES AND TUNING
+------------------------------------------------------------------------------
+
+Initial recommended values (TUNE WITH TESTING):
+
+  START_THRESHOLD:  2.0 lbs above baseline noise
+    - Rationale: Most cable exercises involve >5 lb cable tension
+    - Too low: False triggers from cable adjustment, bumps
+    - Too high: Misses light weight exercises
+    
+  END_THRESHOLD:    0.5 lbs above baseline (near zero)
+    - Rationale: Rep ends when weight is released/returned
+    - Should be lower than START to provide hysteresis
+    
+  MIN_REP_DURATION: 400 ms (0.4 seconds)
+    - Rationale: Fastest realistic rep is ~0.5 seconds
+    - Filters out bumps, adjustments, accidental triggers
+    
+  MAX_REP_DURATION: 10000 ms (10 seconds)  
+    - Rationale: If rep exceeds this, likely stuck or error
+    - Auto-reset state machine to IDLE
+    
+  SETTLING_TIME:    500 ms between reps
+    - Rationale: Prevents double-counting on bouncy movements
+    - Time after rep ends before new rep can start
+
+NOISE FLOOR CALIBRATION:
+  - After tare, sample force for 1-2 seconds
+  - Calculate standard deviation of readings
+  - Set START_THRESHOLD = 3 * stddev + baseline
+  - This adapts to sensor noise level automatically
+
+------------------------------------------------------------------------------
+19.3 METRIC DEFINITIONS
+------------------------------------------------------------------------------
+
+REP METRICS (calculated per rep):
+
+  rep_number:    Sequential count since session start (1, 2, 3, ...)
+  
+  peak_force:    Maximum force reading during rep (in lbs)
+                 Recorded continuously during IN_REP state
+                 
+  duration:      Total time from rep start to rep end (in ms)
+                 duration = end_time - start_time
+                 
+  tempo:         Ratio of concentric to eccentric phase durations
+                 tempo = concentric_duration / eccentric_duration
+                 - tempo > 1.0 = faster concentric (typical for most exercises)
+                 - tempo < 1.0 = slower concentric (eccentric emphasis)
+                 - tempo ≈ 1.0 = balanced phases
+                 
+  concentric_duration:  Time from rep start to peak force (lifting phase)
+  eccentric_duration:   Time from peak force to rep end (lowering phase)
+  
+  average_force: Mean force during rep (sum of samples / count)
+                 Useful for work calculation
+                 
+  rom_cm:        Range of motion in centimeters (from IMU position)
+                 ROM = max(height) - min(height) during rep
+
+------------------------------------------------------------------------------
+19.4 IMU USAGE IN REP DETECTION
+------------------------------------------------------------------------------
+
+CURRENT APPROACH (Phase 2):
+  IMU is NOT required for basic rep detection. Force threshold crossing is
+  sufficient for counting reps. This simplifies implementation and reduces
+  algorithm complexity.
+
+IMU DATA ENHANCEMENT (Optional):
+  The IMU can enhance rep detection in these ways:
+  
+  1. PHASE DETECTION:
+     - Concentric phase: velocity > 0 (moving up) 
+     - Eccentric phase: velocity < 0 (moving down)
+     - Peak force typically occurs at phase transition
+     
+  2. FORM VALIDATION:
+     - Excessive acceleration may indicate jerky movement
+     - Consistent velocity profiles indicate controlled reps
+     
+  3. FALSE POSITIVE FILTERING:
+     - Force spike WITHOUT corresponding movement = machine jostle
+     - Require force AND velocity to start rep for higher accuracy
+     
+  4. EXERCISE CLASSIFICATION (Future):
+     - Different exercises have characteristic motion patterns
+     - Vertical vs horizontal movement, rotation, etc.
+
+RECOMMENDATION FOR PHASE 2:
+  Implement force-only rep detection first. Log IMU data alongside for
+  later analysis. Add IMU-based enhancements in Phase 3+ after collecting
+  real workout data to validate patterns.
+
+------------------------------------------------------------------------------
+19.5 EDGE CASES AND MITIGATIONS
+------------------------------------------------------------------------------
+
+EDGE CASE: Very light weights (<5 lbs)
+  - May not exceed START_THRESHOLD reliably
+  - Mitigation: Allow threshold adjustment via config
+  - Future: Auto-calibrate threshold based on first few reps
+
+EDGE CASE: Isometric holds (static force, no movement)
+  - Force sustained but no rep completion
+  - Mitigation: MAX_REP_DURATION timeout resets state
+  - Log as "hold" event, not "rep"
+
+EDGE CASE: Partial reps (don't complete full ROM)
+  - Force may not drop below END_THRESHOLD
+  - Mitigation: Accept rep if force drops by >50% of peak
+  - Or: Use IMU position to detect direction reversal
+
+EDGE CASE: Machine adjustment (selecting weight)
+  - Can cause force spikes during pin insertion
+  - Mitigation: Require MIN_REP_DURATION
+  - Mitigation: SETTLING_TIME after large force changes
+
+EDGE CASE: Cable bounce at rep end
+  - Force oscillates around END_THRESHOLD
+  - Mitigation: Require force to stay below END_THRESHOLD for debounce period (50ms)
+
+EDGE CASE: Walking away mid-set
+  - Device should reset rep state
+  - Mitigation: If no force > noise floor for 30 seconds, reset session
+
+
+================================================================================
+20. SENSOR SYNCHRONIZATION & TIMING
+================================================================================
+
+This section describes how to maintain temporal alignment between sensors.
+
+------------------------------------------------------------------------------
+20.1 CURRENT TIMING ARCHITECTURE
+------------------------------------------------------------------------------
+
+The firmware uses a non-blocking loop with millis()-based timing:
+
+  loop() {
+    now = millis()
+    
+    // Load cell: every 200ms (5 Hz)
+    if (now - lastLoadCell >= 200) {
+      weight = loadcell::read()
+      delay(5)  // I2C settling
+      lastLoadCell = now
+    }
+    
+    // IMU: every 50ms (20 Hz)
+    if (now - lastIMU >= 50) {
+      delay(2)  // I2C settling
+      imu = imu::read()
+      position::update(imu)
+      lastIMU = now
+    }
+    
+    // BLE: every 100ms (10 Hz)
+    if (now - lastBLE >= 100) {
+      ble::send(position, weight)
+      lastBLE = now
+    }
+  }
+
+KEY TIMING CONSTRAINTS:
+  - Load cell and IMU cannot read simultaneously (shared I2C bus)
+  - Small delays between reads prevent I2C bus contention
+  - BLE sends most recent readings from each sensor
+
+------------------------------------------------------------------------------
+20.2 SYNCHRONIZATION APPROACH
+------------------------------------------------------------------------------
+
+CURRENT STRATEGY: Nearest-Neighbor Interpolation
+  - Each BLE packet contains the LATEST reading from each sensor
+  - Sensors are read back-to-back in the loop to minimize temporal skew
+  - Timestamp reflects BLE transmission time (millis() at send)
+  - Client should treat data as "approximately simultaneous"
+
+TEMPORAL SKEW ANALYSIS:
+  - Load cell reads every 200ms, IMU every 50ms, BLE every 100ms
+  - Maximum skew between load cell and IMU: ~200ms (worst case)
+  - Typical skew: <50ms (within one IMU sample period)
+  - For rep detection, this is acceptable (rep durations are 500-3000ms)
+
+FUTURE ENHANCEMENT (Phase 3+):
+  If tighter synchronization is needed:
+  1. Buffer both sensors with timestamps
+  2. Interpolate load cell readings to match IMU timestamps
+  3. Send synchronized samples at fixed intervals
+  
+  This adds complexity and memory usage, so defer until proven necessary.
+
+------------------------------------------------------------------------------
+20.3 TIMING DIAGRAM
+------------------------------------------------------------------------------
+
+Time (ms) -->  0    50   100  150  200  250  300  350  400
+              |    |    |    |    |    |    |    |    |
+Load Cell     R---------R---------R---------R---------R
+              ↓         ↓         ↓         ↓         ↓
+              W1        W2        W3        W4        W5
+              
+IMU           R----R----R----R----R----R----R----R----R
+              ↓    ↓    ↓    ↓    ↓    ↓    ↓    ↓    ↓
+              I1   I2   I3   I4   I5   I6   I7   I8   I9
+              
+BLE TX             X---------X---------X---------X----
+                   ↓         ↓         ↓         ↓
+                   (I2,W1)   (I4,W2)   (I7,W3)   (I9,W4)
+
+Legend: R = Read, X = Transmit, W = Weight sample, I = IMU sample
+
+BLE packets contain the most recent weight and IMU readings available.
+
+
+================================================================================
+21. DEFERRED FEATURES & OUT-OF-SCOPE ITEMS
+================================================================================
+
+This section explicitly lists features that are NOT being implemented in
+the current phase to help developers focus on what matters now.
+
+------------------------------------------------------------------------------
+21.1 HARDWARE CAPABILITIES NOT CURRENTLY USED
+------------------------------------------------------------------------------
+
+LIS3MDL MAGNETOMETER:
+  Status: Present on hardware, NOT initialized in firmware
+  Reason: Not needed for force/motion tracking
+  Future use: Could enable orientation sensing, compass heading
+  Power impact: Keeping disabled saves ~100µA
+  
+SHT30 TEMPERATURE/HUMIDITY SENSOR:
+  Status: Present on hardware, NOT initialized in firmware
+  Reason: Environmental data not needed for workout tracking
+  Future use: Could log gym conditions, humidity for grip analysis
+  
+EXTERNAL ANTENNA CONNECTOR:
+  Status: Available but not connected
+  Reason: Onboard antenna sufficient for development
+  Future use: May need for production if RF range is insufficient
+  
+QSPI FLASH (2MB):
+  Status: Available, not currently used
+  Reason: Calibration stored in internal flash (Preferences)
+  Future use: Workout data buffering for offline storage (Phase 4+)
+
+------------------------------------------------------------------------------
+21.2 DEFERRED FEATURES BY PHASE
+------------------------------------------------------------------------------
+
+DEFERRED TO PHASE 3:
+  - Binary BLE packet format (staying with ASCII CSV)
+  - Full power state machine implementation
+  - Sleep modes and RAM retention
+  - Motion interrupt wake-up
+  - Adaptive advertising (slow when idle, fast on motion)
+  - Current draw measurement and optimization
+
+DEFERRED TO PHASE 4:
+  - On-device rep event BLE characteristic
+  - Flash storage for unclaimed reps
+  - Exercise classification by motion pattern
+  - Advanced rep analytics (power output, work done)
+
+DEFERRED TO PHASE 5+:
+  - Multi-device hub/gateway
+  - DFU (Device Firmware Update) over BLE
+  - Gym-scale deployment features
+  - Backend integration for workout sync
+
+------------------------------------------------------------------------------
+21.3 EXPLICITLY OUT OF SCOPE
+------------------------------------------------------------------------------
+
+These features are NOT planned for the foreseeable future:
+
+  - Touchscreen or display on device
+  - Audio feedback (beeps, voice)
+  - WiFi connectivity (BLE only)
+  - GPS or location tracking
+  - Heart rate monitoring integration
+  - Camera or video capture
+  - Direct cloud connectivity (phone app mediates)
+
+
+================================================================================
+22. CHANGELOG & VERSION HISTORY
+================================================================================
+
+This section tracks significant changes to the architecture document.
+
+------------------------------------------------------------------------------
+VERSION HISTORY
+------------------------------------------------------------------------------
+
+2026-01-14: Major Update for Phase 2
+  - Updated hardware diagram: HX711 → NAU7802 with I2C interface
+  - Added Section 6.1: BLE Data Contract with full specification
+  - Added Section 10.1: Phase 2 Focus Summary for developers
+  - Added Section 19: Rep Detection Design Specification
+  - Added Section 20: Sensor Synchronization & Timing
+  - Added Section 21: Deferred Features & Out-of-Scope Items
+  - Added Section 22: Changelog
+  - Added "How to use this document" guide at top
+  - Marked Phase 1 as COMPLETED with achievements documented
+  - Updated Phase 2 with clear in-scope/out-of-scope items
+  - Updated glossary: Added NAU7802, updated IMU to ICM-20948
+  
+2026-01-12: NAU7802 Integration Complete
+  - Updated Phase 1 roadmap with completion status
+  - Documented I2C timing challenges and solutions
+  - Added calibration factor corruption fix details
+
+2025-12-20: Initial Document
+  - Created comprehensive architecture document
+  - Defined 7-phase roadmap
+  - Documented HX711 load cell approach (later changed to NAU7802)
+  - Established coding guidelines and best practices
 
 
 ================================================================================
