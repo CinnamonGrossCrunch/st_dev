@@ -111,14 +111,14 @@ GPIO        General Purpose Input/Output. Pins on a microcontroller that can
 
 HX711       A specific IC (integrated circuit) that amplifies tiny signals
             from strain gauge load cells and converts them to digital values.
-            Very common in DIY scale projects.
+            Uses bit-banged GPIO protocol. Replaced by NAU7802 in current design.
 
 I2C         Inter-Integrated Circuit. A two-wire communication protocol used
             to connect sensors to microcontrollers. Pronounced "I-squared-C."
 
 IMU         Inertial Measurement Unit. A sensor package containing an
             accelerometer (measures acceleration/tilt) and gyroscope
-            (measures rotation rate). Some include magnetometers.
+            (measures rotation rate). Current design uses ICM-20948 9-DOF.
 
 Interrupt   A hardware signal that immediately gets the processor's attention,
             waking it from sleep or interrupting normal code execution.
@@ -128,6 +128,10 @@ Load Cell   A transducer (sensor) that converts mechanical force into an
             their resistance.
 
 MCU         Microcontroller Unit. The "brain" of the device - a small
+
+NAU7802     A precision 24-bit ADC with built-in amplifier designed for
+            load cell applications. Uses I2C interface at address 0x2A.
+            Lower noise and power than HX711, with programmable gain.
             computer on a single chip.
 
 MTU         Maximum Transmission Unit. The largest packet size that can be
@@ -232,10 +236,10 @@ This means the device firmware stays simple and doesn't need user management.
                     │         STRONGTRAK DEVICE           │
                     │                                     │
   ┌─────────┐       │  ┌─────────────────────────────┐   │
-  │  LOAD   │───────┼─►│          HX711              │   │
+  │  LOAD   │───────┼─►│         NAU7802             │   │
   │  CELL   │       │  │   (Amplifier + 24-bit ADC)  │   │
   │ 0-200kg │       │  └──────────┬──────────────────┘   │
-  └─────────┘       │             │ GPIO (Data + Clock)  │
+  └─────────┘       │             │ I2C (SDA + SCL)      │
                     │             ▼                      │
                     │  ┌─────────────────────────────┐   │
                     │  │      nRF52840 MCU           │   │
@@ -244,13 +248,14 @@ This means the device firmware stays simple and doesn't need user management.
                     │  │  │  64 MHz, 256KB RAM  │    │   │
                     │  │  │  1MB Flash          │    │   │
                     │  │  └─────────────────────┘    │   │
-                    │  │         │ I2C                │   │
+                    │  │         │ I2C Bus            │   │
                     │  └─────────┼────────────────────┘   │
                     │            ▼                       │
                     │  ┌─────────────────────────────┐   │
                     │  │   ONBOARD SENSORS           │   │
-                    │  │   - LSM6DS3TR-C (IMU)       │   │
+                    │  │   - ICM-20948 (9-DOF IMU)   │   │
                     │  │   - LIS3MDL (Magnetometer)  │   │
+                    │  │   - SHT30 (Temp/Humidity)   │   │
                     │  └─────────────────────────────┘   │
                     │                                     │
                     │  ┌─────────────────────────────┐   │
@@ -263,15 +268,19 @@ This means the device firmware stays simple and doesn't need user management.
 
 KEY HARDWARE INTERFACES
 -----------------------
-1. HX711 <-> MCU: Two GPIO pins (Data + Clock). This is a bit-banged protocol
-   (manually toggling pins), not I2C or SPI. The HX711 is slow (~10-80 Hz)
-   but very low power when idle.
+1. NAU7802 <-> MCU: I2C interface at address 0x2A. Provides 24-bit ADC readings
+   with programmable gain (1x to 128x). Sample rates up to 320 SPS with built-in
+   digital filtering. Much lower power and noise compared to HX711.
 
-2. IMU <-> MCU: I2C bus at 400 kHz. The IMU can generate interrupts on motion
+2. IMU <-> MCU: I2C bus at 400 kHz. The ICM-20948 provides 9-DOF sensing with
+   accelerometer, gyroscope, and magnetometer. Can generate interrupts on motion
    detection, which is critical for waking the device from sleep.
 
 3. BLE Radio: Built into the nRF52840. Shares the same processor but has its
    own power domain that can stay active during sleep.
+
+4. I2C Bus Sharing: Both NAU7802 and IMU share the same I2C bus. Careful timing
+   and addressing prevents conflicts. NAU7802 uses address 0x2A, IMU uses 0x68.
 
 
 ================================================================================
@@ -291,8 +300,8 @@ strongtrak/
 │   ├── state_machine.h/.cpp    # Central state machine (IDLE, CONNECTED, etc.)
 │   │
 │   ├── sensors/
-│   │   ├── imu.h/.cpp          # IMU abstraction (current code)
-│   │   ├── loadcell.h/.cpp     # HX711 + load cell driver
+│   │   ├── imu.h/.cpp          # IMU abstraction (ICM-20948 + variants)
+│   │   ├── loadcell.h/.cpp     # NAU7802 + load cell driver
 │   │   └── battery.h/.cpp      # Battery voltage monitoring
 │   │
 │   ├── processing/
@@ -337,10 +346,11 @@ sensors/imu
   - Provide "is moving" detection
 
 sensors/loadcell
-  - Initialize HX711 with gain setting
-  - Read raw ADC values
+  - Initialize NAU7802 with gain setting and sample rate
+  - Read raw 24-bit ADC values via I2C
   - Apply calibration (offset + scale factor)
   - Return force in kg or Newtons
+  - Handle I2C timing to avoid bus conflicts with IMU
 
 sensors/battery
   - Read battery voltage via ADC
@@ -593,55 +603,94 @@ PROOF TEST:
 - Disconnect/reconnect BLE 10 times, verify no hangs
 
 ------------------------------------------------------------------------------
-PHASE 1: HX711 + LOAD CELL INTEGRATION (2-4 weeks)
+PHASE 1: NAU7802 + LOAD CELL INTEGRATION (COMPLETED ✅)
 ------------------------------------------------------------------------------
 
-GOAL: Read force data from inline load cell via HX711.
+GOAL: Read force data from inline load cell via NAU7802.
 
 TASKS:
-[ ] Wire HX711 to Feather (Data -> GPIO, Clock -> GPIO, VCC, GND)
-[ ] Create loadcell.h/.cpp module
-[ ] Implement HX711 bit-bang protocol (or use library)
-[ ] Read raw ADC values, verify stability
-[ ] Implement tare (zero offset)
-[ ] Implement two-point calibration (known weights)
-[ ] Store calibration in flash (Preferences or LittleFS)
-[ ] Add load cell data to BLE stream
-[ ] Add load cell data to Teleplot output
+[x] Wire NAU7802 to Feather (VCC, GND, SDA, SCL, DRDY interrupt)
+[x] Create loadcell.h/.cpp module with backend abstraction  
+[x] Implement NAU7802 I2C protocol and register configuration
+[x] Read raw 24-bit ADC values, verify stability
+[x] Implement tare (zero offset) via serial commands
+[x] Implement two-point calibration (known weights)
+[x] Store calibration in flash (Preferences)
+[x] Add load cell data to BLE stream (CSV format)
+[x] Add load cell data to Teleplot output
+[x] Resolve I2C timing conflicts with IMU
+[x] Fix calibration factor corruption bug
+
+SUCCESS CRITERIA: ✅ ACHIEVED
+- Read force with <1% error after calibration ✅
+- Tare works reliably ✅  
+- Data streams alongside IMU ✅
+- Stable operation for extended periods ✅
+
+KEY CHALLENGES OVERCOME:
+- I2C BUS CONFLICTS: NAU7802 and IMU sharing I2C bus caused timing issues.
+  Solution: Reduced sampling rates and added I2C delays (5ms NAU7802, 2ms IMU).
+
+- CALIBRATION CORRUPTION: Calibration factor corrupted from -8309 to -419.
+  Root cause: I2C timing conflicts during flash writes.
+  Solution: Proper I2C timing and verified calibration storage.
+
+- SAMPLE RATE OPTIMIZATION: Balanced between resolution and power consumption.
+  Final: NAU7802 at 5Hz (200ms), IMU at 20Hz (50ms) with proper delays.
+
+PROOF TEST: ✅ COMPLETED  
+- Verified accurate readings with known weights (5.00 lbs calibration)
+- Confirmed stable tare operation
+- Demonstrated reliable BLE streaming with web dashboard
+
+IMPLEMENTATION DETAILS:
+- NAU7802 configured: Gain 128x, 80 SPS, I2C address 0x2A
+- Backend abstraction supports both NAU7802 and HX711 (future flexibility)
+- Modular architecture: loadcell.cpp + loadcell_backend_nau7802.cpp
+
+------------------------------------------------------------------------------
+PHASE 2: ENHANCED IMU INTEGRATION + REP DETECTION (IN PROGRESS 🔄)
+------------------------------------------------------------------------------
+
+GOAL: Improve IMU data quality and implement basic rep detection algorithms.
+
+CURRENT STATUS:
+- ✅ ICM-20948 9-DOF IMU integrated and streaming
+- ✅ Position/velocity estimation working  
+- ✅ BLE data contract includes height_cm,velocity_m/s,weight_lbs
+- ✅ Z-axis accelerometer corrected for proper gravity reading
+- 🔄 Next: Rep counting and movement analysis
+
+TASKS:
+[x] Verify IMU data quality and calibration
+[x] Fix Z-axis orientation for gravity reference
+[ ] Implement motion detection for device wake-up
+[ ] Design rep detection algorithm (force + motion patterns)
+[ ] Create rep counter with concentric/eccentric phase detection  
+[ ] Add range of motion analysis
+[ ] Implement exercise classification (squat vs deadlift vs row)
+[ ] Add rep event notifications to BLE stream
 
 SUCCESS CRITERIA:
-- Read force with <1% error after calibration
-- Tare works reliably
-- Data streams alongside IMU
+- Rep detection accuracy >95% compared to manual count
+- Exercise classification works for major movement patterns
+- Motion-based device wake < 100ms latency
+- Stable operation with both load cell and IMU data
 
-KEY RISKS:
-- HX711 NOISE: The HX711 is notoriously sensitive to electrical noise.
-  Mitigation: Use shielded cable, keep wires short, add decoupling caps.
+KEY FOCUS AREAS:
+- REP ALGORITHM: Combine force profile with accelerometer patterns
+  Load cell provides force curve, IMU provides movement velocity/direction
 
-- SAMPLE RATE TRADEOFF: HX711 max rate is 80 Hz (at lower resolution) or
-  10 Hz (at higher resolution, 24-bit mode). Must choose based on needs.
-  Mitigation: Start with 10 Hz for stability, increase if needed.
+- SENSOR FUSION: Integrate load cell + IMU for comprehensive rep analysis
+  Force curve + velocity profile = complete rep characterization  
 
-- POWER: HX711 draws ~1.5mA when active. Must power down between samples.
-  Mitigation: Use HX711 power-down mode (clock high for >60µs).
+- POWER OPTIMIZATION: Use IMU motion interrupt to trigger fast advertising
+  Device stays in low-power until movement detected
 
 PROOF TEST:
-- Hang known weight (e.g., 10 kg), verify reading is accurate ±0.1 kg
-- Tare, add weight, verify reads correctly, remove weight, verify returns to 0
-
-LIBRARIES TO EVALUATE:
-- "bogde/HX711" - most popular, but may have issues
-- "olkal/HX711_ADC" - more advanced, async support
-- Write your own bit-bang (simple, full control)
-
-Recommendation: Write your own. The protocol is simple (24 clock pulses to
-read 24 bits), and you'll understand it fully. Avoid library surprises.
-
-------------------------------------------------------------------------------
-PHASE 2: BLE PACKET FORMAT + ROBUST STREAMING (2-3 weeks)
-------------------------------------------------------------------------------
-
-GOAL: Define efficient data format, handle connection robustness.
+- Do 10 reps of various exercises, device counts 10 reps correctly
+- Verify rep timing matches actual movement phases
+- Test motion wake from device sleep state
 
 TASKS:
 [ ] Define binary packet format (header, timestamp, force, accel, gyro)
